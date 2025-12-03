@@ -6,12 +6,9 @@ use tokio::sync::RwLock;
 
 // Store onboarding state: user_id -> (why_joined, corelane_address)
 type OnboardingState = Arc<RwLock<HashMap<u64, (Option<String>, Option<String>)>>>;
-// Store welcome message IDs: user_id -> message_id (to delete after onboarding)
-type WelcomeMessages = Arc<RwLock<HashMap<u64, MessageId>>>;
 
 struct Handler {
     onboarding_state: OnboardingState,
-    welcome_messages: WelcomeMessages,
     member_role_id: RoleId,
     onboarding_channel_id: Option<ChannelId>,
     admin_channel_id: Option<ChannelId>,
@@ -22,56 +19,24 @@ impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
         println!("✅ Bot is ready! Logged in as: {}", ready.user.name);
 
-        // Clean up any old messages and pinned messages in the onboarding channel
+        // Clean up old bot messages in onboarding channel on startup
         if let Some(onboarding_channel) = self.onboarding_channel_id {
-            println!("🧹 Cleaning up old messages in onboarding channel...");
-
-            // Unpin all pinned messages from this bot (to remove any pinned welcome messages)
-            if let Ok(pins) = onboarding_channel.pins(&ctx.http).await {
-                for pinned_msg in pins {
-                    if pinned_msg.author.id == ready.user.id {
-                        if let Err(e) = pinned_msg.unpin(&ctx.http).await {
-                            eprintln!("⚠️  Could not unpin message {}: {:?}", pinned_msg.id, e);
-                        } else {
-                            println!("✅ Unpinned old message: {}", pinned_msg.id);
-                        }
-                    }
-                }
-            }
-
-            // Get recent messages from the channel and delete old messages (both bot and user messages from old onboarding flow)
             let retriever = GetMessages::new().limit(100);
             if let Ok(messages) = onboarding_channel.messages(&ctx.http, retriever).await {
                 let bot_id = ready.user.id;
                 let mut deleted_count = 0;
-
                 for msg in messages {
-                    let should_delete = if msg.author.id == bot_id {
-                        // Delete ALL bot messages
-                        true
-                    } else {
-                        // Delete user messages that look like old onboarding responses
-                        // (messages containing Corelane addresses or "learn about" type responses)
-                        msg.content.len() > 20 && (
-                            msg.content.contains("tb1q") || // Bitcoin/Corelane address pattern
-                            msg.content.contains("learn about") ||
-                            msg.content.contains("to learn") ||
-                            msg.content.len() > 50 // Long messages likely contain addresses
-                        )
-                    };
-
-                    if should_delete {
+                    // Delete ALL messages from this bot
+                    if msg.author.id == bot_id {
                         if let Err(e) = msg.delete(&ctx.http).await {
-                            eprintln!("⚠️  Could not delete old message {} from {}: {:?}", msg.id, msg.author.name, e);
-                            eprintln!("   Make sure bot has 'Manage Messages' permission to delete user messages");
+                            eprintln!("⚠️  Could not delete old message {}: {:?}", msg.id, e);
                         } else {
                             deleted_count += 1;
                         }
                     }
                 }
-
                 if deleted_count > 0 {
-                    println!("✅ Deleted {} old message(s) from channel", deleted_count);
+                    println!("🧹 Deleted {} old bot message(s) on startup", deleted_count);
                 }
             }
         }
@@ -80,14 +45,10 @@ impl EventHandler for Handler {
     async fn guild_member_removal(&self, _ctx: Context, _guild_id: GuildId, user: User, _member: Option<Member>) {
         println!("Member left: {} ({})", user.name, user.id);
 
-        // Clean up onboarding state and welcome message tracking
+        // Clean up onboarding state
         {
             let mut state = self.onboarding_state.write().await;
             state.remove(&user.id.get());
-        }
-        {
-            let mut welcome_msgs = self.welcome_messages.write().await;
-            welcome_msgs.remove(&user.id.get());
         }
     }
 
@@ -104,44 +65,52 @@ impl EventHandler for Handler {
             state.insert(new_member.user.id.get(), (None, None));
         }
 
-        // Send welcome message with button directly to the onboarding channel
+        // Create welcome message with button in onboarding channel (generic, no @nickname)
         if let Some(onboarding_channel) = self.onboarding_channel_id {
-            // Create welcome message with button
+            // Delete ALL old messages from this bot first (clean slate)
+            let retriever = GetMessages::new().limit(100);
+            if let Ok(messages) = onboarding_channel.messages(&ctx.http, retriever).await {
+                let bot_id = ctx.cache.current_user().id;
+                let mut deleted_count = 0;
+                for msg in messages {
+                    // Delete ALL messages from this bot
+                    if msg.author.id == bot_id {
+                        if let Err(e) = msg.delete(&ctx.http).await {
+                            eprintln!("⚠️  Could not delete old message {}: {:?}", msg.id, e);
+                        } else {
+                            deleted_count += 1;
+                        }
+                    }
+                }
+                if deleted_count > 0 {
+                    println!("🧹 Deleted {} old bot message(s) before creating new welcome message", deleted_count);
+                }
+            }
+
+            // Create welcome message with button (generic, no @nickname)
             let components = vec![CreateActionRow::Buttons(vec![
                 CreateButton::new("start_onboarding")
                     .label("Start Onboarding")
                     .style(ButtonStyle::Primary),
             ])];
 
-            let welcome_message = format!(
-                "Welcome to the server, {}! 👋\n\nPlease click the button below to start the onboarding process. You'll need to fill out a form with:\n1. Why you joined\n2. Your Corelane address\n\nOnce complete, you'll get access to all channels!",
-                new_member.user.mention()
-            );
+            let welcome_message = "Welcome to the server! 👋\n\nPlease click the button below to start the onboarding process. You'll need to fill out a form with:\n1. Why you joined\n2. Your Corelane address\n\nOnce complete, you'll get access to all channels!";
 
             let message = CreateMessage::new()
                 .content(welcome_message)
                 .components(components);
 
-            println!("📤 Sending welcome message with button to channel for {}...", new_member.user.name);
+            // Create the welcome message
             match onboarding_channel.send_message(&ctx.http, message).await {
-                Ok(msg) => {
-                    // Store the message ID so we can delete it after onboarding
-                    {
-                        let mut welcome_msgs = self.welcome_messages.write().await;
-                        welcome_msgs.insert(new_member.user.id.get(), msg.id);
-                    }
-                    println!("✅ Sent welcome message to channel for {}", new_member.user.name);
-                    println!("   Message ID: {} (will be deleted after onboarding)", msg.id);
-                    println!("   User should see the message with a 'Start Onboarding' button in the channel");
+                Ok(_) => {
+                    println!("✅ Created welcome message in onboarding channel for new user");
                 }
                 Err(e) => {
-                    eprintln!("❌ Could not send welcome message to channel: {:?}", e);
-                    eprintln!("   Make sure the bot has 'Send Messages' permission in the onboarding channel");
+                    eprintln!("❌ Could not create welcome message in onboarding channel: {:?}", e);
+                    eprintln!("   Make sure the bot has 'Send Messages' permission");
                     eprintln!("   Channel ID: {}", onboarding_channel);
                 }
             }
-        } else {
-            eprintln!("⚠️  ONBOARDING_CHANNEL_ID not set - cannot send welcome message");
         }
     }
 
@@ -261,17 +230,6 @@ impl EventHandler for Handler {
                                     eprintln!("Error responding to form: {:?}", e);
                                 }
 
-                                // Delete the welcome message with the button
-                                // Note: Discord will show "Original message was deleted" - this is unavoidable
-                                if let Some(onboarding_channel) = self.onboarding_channel_id {
-                                    let mut welcome_msgs = self.welcome_messages.write().await;
-                                    if let Some(msg_id) = welcome_msgs.remove(&modal.user.id.get()) {
-                                        if let Ok(msg) = onboarding_channel.message(&ctx.http, msg_id).await {
-                                            let _ = msg.delete(&ctx.http).await;
-                                        }
-                                    }
-                                }
-
                                 // Clean up state
                                 {
                                     let mut state = self.onboarding_state.write().await;
@@ -354,7 +312,6 @@ async fn main() {
 
     let handler = Handler {
         onboarding_state: Arc::new(RwLock::new(HashMap::new())),
-        welcome_messages: Arc::new(RwLock::new(HashMap::new())),
         member_role_id: RoleId::new(member_role_id),
         onboarding_channel_id,
         admin_channel_id,

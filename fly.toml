@@ -1,0 +1,25 @@
+# fly.toml app configuration file generated for discord-access-bot on 2025-12-12T11:09:28+01:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'discord-access-bot'
+primary_region = 'cdg'
+
+[experimental]
+  auto_rollback = true
+
+[build]
+  dockerfile = 'Dockerfile'
+
+[env]
+  RUST_LOG = "info"
+
+[[mounts]]
+  source = 'discord_data'
+  destination = '/data'
+
+[[vm]]
+  cpu_kind = 'shared'
+  cpus = 2
+  memory_mb = 2048

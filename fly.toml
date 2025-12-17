@@ -10,7 +10,7 @@ primary_region = 'cdg'
   auto_rollback = true
 
 [build]
-  dockerfile = 'Dockerfile'
+  image = 'ghcr.io/lanelayer/discord-bot/discord-bot:latest'
 
 [env]
   RUST_LOG = "info"

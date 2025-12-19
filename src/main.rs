@@ -6,11 +6,15 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use anyhow::Context as AnyhowContext;
-use ethers::prelude::*;
-use ethers::providers::{Http, Provider};
-use ethers::signers::Wallet;
+use alloy_primitives::{Address, Bytes, U256};
+use alloy_provider::{Provider, ProviderBuilder};
+use alloy_signer_local::PrivateKeySigner;
+use alloy_network::{Ethereum, TxSigner};
+use alloy_consensus::{TxEip1559, TxEnvelope};
+use alloy_rlp::Encodable;
 use s3::creds::Credentials;
 use s3::{Bucket, Region};
+use std::str::FromStr;
 
 type OnboardingState = Arc<RwLock<HashMap<u64, (Option<String>, Option<String>)>>>;
 
@@ -99,9 +103,10 @@ impl FundingStore {
 
 #[derive(Clone)]
 struct Faucet {
-    provider: Provider<Http>,
-    wallet: Wallet<k256::ecdsa::SigningKey>,
+    provider_url: String,
+    signer: PrivateKeySigner,
     amount: U256,
+    chain_id: u64,
 }
 
 impl Faucet {
@@ -112,45 +117,96 @@ impl Faucet {
             .context("FAUCET_PRIVATE_KEY is required for faucet")?;
         let amount_str = std::env::var("FAUCET_AMOUNT_WEI")
             .context("FAUCET_AMOUNT_WEI is required for faucet")?;
-        let amount = U256::from_dec_str(&amount_str)
+        let amount = U256::from_str_radix(&amount_str, 10)
             .context("FAUCET_AMOUNT_WEI must be a decimal number")?;
         let chain_id = std::env::var("FAUCET_CHAIN_ID")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0);
+            .unwrap_or(1);
 
-        let provider =
-            Provider::<Http>::try_from(rpc_url.clone()).context("Invalid FAUCET_RPC_URL")?;
-        let wallet = private_key
-            .parse::<LocalWallet>()
+        let signer = PrivateKeySigner::from_str(&private_key)
             .context("Invalid FAUCET_PRIVATE_KEY")?;
-        let wallet = if chain_id != 0 {
-            wallet.with_chain_id(chain_id)
-        } else {
-            wallet
-        };
 
         Ok(Self {
-            provider,
-            wallet,
+            provider_url: rpc_url,
+            signer,
             amount,
+            chain_id,
         })
     }
 
-    async fn send_funds(&self, to_addr: &str) -> anyhow::Result<TxHash> {
-        let to: H160 = to_addr.parse().context("Invalid Core Lane address")?;
+    fn get_provider(&self) -> impl Provider<Ethereum> + '_ {
+        let url: url::Url = self.provider_url.parse().expect("Invalid URL");
+        ProviderBuilder::new().connect_http(url)
+    }
 
-        let client = SignerMiddleware::new(self.provider.clone(), self.wallet.clone());
-        let pending = client
-            .send_transaction(
-                TransactionRequest::pay(Address::from(to), self.amount),
-                None,
-            )
-            .await?;
-        let receipt = pending.await?;
-        receipt
-            .map(|r| r.transaction_hash)
-            .ok_or_else(|| anyhow::anyhow!("No transaction hash returned"))
+    async fn send_funds(&self, to_addr: &str) -> anyhow::Result<alloy_primitives::B256> {
+        let to: Address = to_addr.parse().context("Invalid Core Lane address")?;
+        let provider = self.get_provider();
+        let from = self.signer.address();
+
+        // Get the chain ID from provider if not set, otherwise use configured
+        let chain_id = if self.chain_id == 0 {
+            provider
+                .get_chain_id()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to get chain ID: {}", e))?
+        } else {
+            self.chain_id
+        };
+
+        // Get the nonce
+        let nonce = provider
+            .get_transaction_count(from)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to get transaction count: {}", e))?;
+
+        // Get gas price
+        let gas_price = provider
+            .get_gas_price()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to get gas price: {}", e))?;
+
+        // For EIP-1559, use gas price as both max_fee_per_gas and max_priority_fee_per_gas
+        let max_fee_per_gas = U256::from(gas_price);
+        let max_priority_fee_per_gas = U256::from(gas_price) / U256::from(10);
+
+        // Build the EIP-1559 transaction
+        let mut tx = TxEip1559 {
+            chain_id,
+            nonce,
+            max_fee_per_gas: max_fee_per_gas.to::<u128>(),
+            max_priority_fee_per_gas: max_priority_fee_per_gas.to::<u128>(),
+            gas_limit: 21000, // Standard transfer
+            to: alloy_primitives::TxKind::Call(to),
+            value: self.amount,
+            input: Bytes::new(),
+            access_list: Default::default(),
+        };
+
+        // Sign the transaction
+        let signature = self
+            .signer
+            .sign_transaction(&mut tx)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to sign transaction: {}", e))?;
+
+        // Create signed transaction and encode
+        let signed_tx = TxEnvelope::Eip1559(
+            alloy_consensus::Signed::new_unchecked(tx, signature, Default::default()),
+        );
+
+        let mut encoded = Vec::new();
+        signed_tx.encode(&mut encoded);
+        let tx_hex = format!("0x{}", hex::encode(&encoded));
+
+        // Send the raw transaction
+        let pending_tx = provider
+            .send_raw_transaction(&Bytes::from_str(&tx_hex)?)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to send transaction: {}", e))?;
+
+        Ok(*pending_tx.tx_hash())
     }
 }
 

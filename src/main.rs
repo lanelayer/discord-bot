@@ -74,7 +74,7 @@ impl FundingStore {
                 let key = format!("funded/{}.json", discord_id);
                 match bucket.head_object(&key).await {
                     Ok(_) => Ok(true),
-                    Err(s3::error::S3Error::Http(code, _)) if code == 404 => Ok(false),
+                    Err(s3::error::S3Error::Http(404, _)) => Ok(false),
                     Err(e) => Err(anyhow::anyhow!("S3 error: {:?}", e)),
                 }
             }
@@ -103,7 +103,7 @@ impl FundingStore {
 
 #[derive(Clone)]
 struct Faucet {
-    provider_url: String,
+    provider_url: url::Url,
     signer: PrivateKeySigner,
     amount: U256,
     chain_id: u64,
@@ -111,8 +111,11 @@ struct Faucet {
 
 impl Faucet {
     async fn new_from_env() -> anyhow::Result<Self> {
-        let rpc_url =
+        let rpc_url_str =
             std::env::var("FAUCET_RPC_URL").context("FAUCET_RPC_URL is required for faucet")?;
+        let provider_url = rpc_url_str
+            .parse::<url::Url>()
+            .context("FAUCET_RPC_URL must be a valid URL")?;
         let private_key = std::env::var("FAUCET_PRIVATE_KEY")
             .context("FAUCET_PRIVATE_KEY is required for faucet")?;
         let amount_str = std::env::var("FAUCET_AMOUNT_WEI")
@@ -122,13 +125,13 @@ impl Faucet {
         let chain_id = std::env::var("FAUCET_CHAIN_ID")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(1);
+            .unwrap_or(0); // 0 means "get from provider"
 
         let signer = PrivateKeySigner::from_str(&private_key)
             .context("Invalid FAUCET_PRIVATE_KEY")?;
 
         Ok(Self {
-            provider_url: rpc_url,
+            provider_url,
             signer,
             amount,
             chain_id,
@@ -136,8 +139,7 @@ impl Faucet {
     }
 
     fn get_provider(&self) -> impl Provider<Ethereum> + '_ {
-        let url: url::Url = self.provider_url.parse().expect("Invalid URL");
-        ProviderBuilder::new().connect_http(url)
+        ProviderBuilder::new().connect_http(self.provider_url.clone())
     }
 
     async fn send_funds(&self, to_addr: &str) -> anyhow::Result<alloy_primitives::B256> {

@@ -9,3 +9,17 @@ tokio = { version = "1.21.2", features = ["macros", "rt-multi-thread"] }
 dotenv = "0.15"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+anyhow = "1.0"
+alloy-primitives = { version = "1.4.0", features = ["serde"] }
+alloy-provider = "1.0.27"
+alloy-transport-http = "1.0.38"
+alloy-signer = "1.0.27"
+alloy-signer-local = "1.0.38"
+alloy-consensus = { version = "1.0.38", features = ["secp256k1", "serde"] }
+alloy-rlp = "0.3"
+alloy-eips = "1.0.27"
+alloy-rpc-types = "1.0.27"
+alloy-network = "1.0.27"
+rust-s3 = { version = "0.33", features = ["tokio"] }
+hex = "0.4"
+url = "2.5"

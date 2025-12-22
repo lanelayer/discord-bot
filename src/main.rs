@@ -357,64 +357,9 @@ impl EventHandler for Handler {
                             return;
                         }
 
-                        // Faucet: attempt only once per Discord account
-                        let mut faucet_tx_hash: Option<alloy_primitives::B256> = None;
-                        let mut faucet_error: Option<String> = None;
-
-                        if let Some(faucet) = &self.faucet {
-                            match self.funding_store.has_funded(member.user.id.get()).await {
-                                Ok(true) => {
-                                    println!(
-                                        "Faucet: user {} already funded, skipping",
-                                        member.user.id
-                                    );
-                                }
-                                Ok(false) => {
-                                    if address.is_empty() {
-                                        eprintln!(
-                                            "Faucet: no address provided, skipping for user {}",
-                                            member.user.id
-                                        );
-                                        faucet_error = Some("No address provided".to_string());
-                                    } else {
-                                        println!(
-                                            "Faucet: sending laneBTC to {} for user {}",
-                                            address, member.user.id
-                                        );
-                                        match faucet.send_funds(&address).await {
-                                            Ok(tx) => {
-                                                println!("Faucet sent: tx hash {:?}", tx);
-                                                faucet_tx_hash = Some(tx);
-                                                if let Err(e) = self
-                                                    .funding_store
-                                                    .mark_funded(member.user.id.get())
-                                                    .await
-                                                {
-                                                    eprintln!(
-                                                        "Faucet: could not mark funded: {:?}",
-                                                        e
-                                                    );
-                                                }
-                                            }
-                                            Err(e) => {
-                                                eprintln!(
-                                                    "Faucet error for user {}: {:?}",
-                                                    member.user.id, e
-                                                );
-                                                faucet_error = Some(format!("Failed to send laneBTC: {}", e));
-                                            }
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("Faucet: could not check funding store: {:?}", e);
-                                    faucet_error = Some("Failed to check funding status".to_string());
-                                }
-                            }
-                        }
-
-                        // Assign the role
-                        match member.add_role(&ctx.http, self.member_role_id).await {
+                        // Assign the role first (fast operation)
+                        let role_result = member.add_role(&ctx.http, self.member_role_id).await;
+                        match role_result {
                             Ok(_) => {
                                 println!("Assigned role {} to {}", self.member_role_id, member.user.name);
 
@@ -436,30 +381,102 @@ impl EventHandler for Handler {
                                     }
                                 }
 
-                                // Build success message with faucet info
-                                let mut success_msg = "**Onboarding Successful!**\n\nWelcome! You have been verified and given access to all channels.".to_string();
-
-                                if let Some(tx_hash) = faucet_tx_hash {
-                                    success_msg.push_str(&format!(
-                                        "\n\n✅ **laneBTC sent!** Transaction: `{:?}`",
-                                        tx_hash
-                                    ));
-                                } else if let Some(err) = faucet_error {
-                                    success_msg.push_str(&format!(
-                                        "\n\n⚠️ **Faucet issue:** {}",
-                                        err
-                                    ));
-                                }
-
+                                // Respond immediately to avoid interaction timeout
+                                let initial_msg = "**Onboarding Successful!**\n\nWelcome! You have been verified and given access to all channels.\n\nProcessing laneBTC faucet...";
                                 let response = CreateInteractionResponse::Message(
                                     CreateInteractionResponseMessage::new()
-                                        .content(success_msg)
+                                        .content(initial_msg)
                                         .ephemeral(true),
                                 );
 
                                 if let Err(e) = modal.create_response(&ctx.http, response).await {
                                     eprintln!("Error responding to form: {:?}", e);
+                                    return;
                                 }
+
+                                // Handle faucet in background and send follow-up
+                                let ctx_clone = ctx.clone();
+                                let modal_clone = modal.clone();
+                                let faucet_clone = self.faucet.clone();
+                                let funding_store_clone = self.funding_store.clone();
+                                let user_id = member.user.id;
+                                let address_clone = address.clone();
+
+                                tokio::spawn(async move {
+                                    let mut faucet_tx_hash: Option<alloy_primitives::B256> = None;
+                                    let mut faucet_error: Option<String> = None;
+
+                                    if let Some(faucet) = &faucet_clone {
+                                        match funding_store_clone.has_funded(user_id.get()).await {
+                                            Ok(true) => {
+                                                println!(
+                                                    "Faucet: user {} already funded, skipping",
+                                                    user_id
+                                                );
+                                            }
+                                            Ok(false) => {
+                                                if address_clone.is_empty() {
+                                                    eprintln!(
+                                                        "Faucet: no address provided, skipping for user {}",
+                                                        user_id
+                                                    );
+                                                    faucet_error = Some("No address provided".to_string());
+                                                } else {
+                                                    println!(
+                                                        "Faucet: sending laneBTC to {} for user {}",
+                                                        address_clone, user_id
+                                                    );
+                                                    match faucet.send_funds(&address_clone).await {
+                                                        Ok(tx) => {
+                                                            println!("Faucet sent: tx hash {:?}", tx);
+                                                            faucet_tx_hash = Some(tx);
+                                                            if let Err(e) = funding_store_clone
+                                                                .mark_funded(user_id.get())
+                                                                .await
+                                                            {
+                                                                eprintln!(
+                                                                    "Faucet: could not mark funded: {:?}",
+                                                                    e
+                                                                );
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            eprintln!(
+                                                                "Faucet error for user {}: {:?}",
+                                                                user_id, e
+                                                            );
+                                                            faucet_error = Some(format!("Failed to send laneBTC: {}", e));
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                eprintln!("Faucet: could not check funding store: {:?}", e);
+                                                faucet_error = Some("Failed to check funding status".to_string());
+                                            }
+                                        }
+                                    }
+
+                                    // Build follow-up message
+                                    let followup_msg = if let Some(tx_hash) = faucet_tx_hash {
+                                        format!(
+                                            "✅ **laneBTC sent!** Transaction: `{:?}`",
+                                            tx_hash
+                                        )
+                                    } else if let Some(err) = faucet_error {
+                                        format!("⚠️ **Faucet issue:** {}", err)
+                                    } else {
+                                        "ℹ️ Faucet not configured.".to_string()
+                                    };
+
+                                    // Send follow-up message
+                                    if let Err(e) = modal_clone
+                                        .create_followup(&ctx_clone.http, CreateInteractionResponseFollowup::new().content(followup_msg).ephemeral(true))
+                                        .await
+                                    {
+                                        eprintln!("Error sending follow-up message: {:?}", e);
+                                    }
+                                });
                             }
                             Err(e) => {
                                 eprintln!("Error assigning role: {:?}", e);

@@ -23,3 +23,4 @@ alloy-network = "1.0.27"
 rust-s3 = { version = "0.33", features = ["tokio"] }
 hex = "0.4"
 url = "2.5"
+reqwest = { version = "0.12", features = ["json"] }

@@ -125,7 +125,7 @@ impl Faucet {
         let chain_id = std::env::var("FAUCET_CHAIN_ID")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0); // 0 means "get from provider"
+            .unwrap_or(1281453634); // Default to Core Lane chain ID
 
         let signer = PrivateKeySigner::from_str(&private_key)
             .context("Invalid FAUCET_PRIVATE_KEY")?;
@@ -147,15 +147,8 @@ impl Faucet {
         let provider = self.get_provider();
         let from = self.signer.address();
 
-        // Get the chain ID from provider if not set, otherwise use configured
-        let chain_id = if self.chain_id == 0 {
-            provider
-                .get_chain_id()
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to get chain ID: {}", e))?
-        } else {
-            self.chain_id
-        };
+        // Use configured chain ID (Core Lane: 1281453634)
+        let chain_id = self.chain_id;
 
         // Get nonce
         let nonce = provider

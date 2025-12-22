@@ -1,10 +1,223 @@
 use serenity::all::*;
 use serenity::async_trait;
 
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use tokio::sync::RwLock;
+
+use anyhow::Context as AnyhowContext;
+use alloy_primitives::{Address, Bytes, U256};
+use alloy_provider::{Provider, ProviderBuilder};
+use alloy_signer_local::PrivateKeySigner;
+use alloy_network::{Ethereum, TxSigner};
+use alloy_consensus::{TxEip1559, TxEnvelope};
+use alloy_eips::eip2718::Encodable2718;
+use s3::creds::Credentials;
+use s3::{Bucket, Region};
+use std::str::FromStr;
+
+type OnboardingState = Arc<RwLock<HashMap<u64, (Option<String>, Option<String>)>>>;
+
+#[derive(Clone)]
+enum FundingBackend {
+    Memory(Arc<RwLock<HashSet<u64>>>),
+    S3 { bucket: Bucket },
+}
+
+#[derive(Clone)]
+struct FundingStore {
+    backend: FundingBackend,
+}
+
+impl FundingStore {
+    async fn new_from_env() -> anyhow::Result<Self> {
+        let backend = std::env::var("FUNDING_BACKEND").unwrap_or_else(|_| "memory".to_string());
+        if backend.eq_ignore_ascii_case("s3") {
+            let bucket_name =
+                std::env::var("S3_BUCKET").context("S3_BUCKET required when FUNDING_BACKEND=s3")?;
+            let region_name =
+                std::env::var("S3_REGION").context("S3_REGION required when FUNDING_BACKEND=s3")?;
+            let endpoint = std::env::var("S3_ENDPOINT")
+                .context("S3_ENDPOINT required when FUNDING_BACKEND=s3")?;
+            let access_key = std::env::var("S3_ACCESS_KEY")
+                .context("S3_ACCESS_KEY required when FUNDING_BACKEND=s3")?;
+            let secret_key = std::env::var("S3_SECRET_KEY")
+                .context("S3_SECRET_KEY required when FUNDING_BACKEND=s3")?;
+
+            let region = Region::Custom {
+                region: region_name,
+                endpoint,
+            };
+            let credentials =
+                Credentials::new(Some(&access_key), Some(&secret_key), None, None, None)?;
+            let mut bucket = Bucket::new(&bucket_name, region, credentials)
+                .map_err(|e| anyhow::anyhow!("Failed to create S3 bucket: {}", e))?;
+            bucket.set_path_style();
+
+            Ok(Self {
+                backend: FundingBackend::S3 { bucket },
+            })
+        } else {
+            Ok(Self {
+                backend: FundingBackend::Memory(Arc::new(RwLock::new(HashSet::new()))),
+            })
+        }
+    }
+
+    async fn has_funded(&self, discord_id: u64) -> anyhow::Result<bool> {
+        match &self.backend {
+            FundingBackend::Memory(set) => {
+                let guard = set.read().await;
+                Ok(guard.contains(&discord_id))
+            }
+            FundingBackend::S3 { bucket } => {
+                let key = format!("funded/{}.json", discord_id);
+                match bucket.head_object(&key).await {
+                    Ok(_) => Ok(true),
+                    Err(s3::error::S3Error::Http(code, _)) if code == 404 => Ok(false),
+                    Err(e) => Err(anyhow::anyhow!("S3 error: {:?}", e)),
+                }
+            }
+        }
+    }
+
+    async fn mark_funded(&self, discord_id: u64) -> anyhow::Result<()> {
+        match &self.backend {
+            FundingBackend::Memory(set) => {
+                let mut guard = set.write().await;
+                guard.insert(discord_id);
+                Ok(())
+            }
+            FundingBackend::S3 { bucket } => {
+                let key = format!("funded/{}.json", discord_id);
+                let body = b"{\"funded\":true}";
+                bucket
+                    .put_object(&key, body)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| anyhow::anyhow!(e))
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Faucet {
+    provider_url: String,
+    signer: PrivateKeySigner,
+    amount: U256,
+    chain_id: u64,
+}
+
+impl Faucet {
+    async fn new_from_env() -> anyhow::Result<Self> {
+        let rpc_url =
+            std::env::var("FAUCET_RPC_URL").context("FAUCET_RPC_URL is required for faucet")?;
+        let private_key = std::env::var("FAUCET_PRIVATE_KEY")
+            .context("FAUCET_PRIVATE_KEY is required for faucet")?;
+        let amount_str = std::env::var("FAUCET_AMOUNT_WEI")
+            .context("FAUCET_AMOUNT_WEI is required for faucet")?;
+        let amount = U256::from_str_radix(&amount_str, 10)
+            .context("FAUCET_AMOUNT_WEI must be a decimal number")?;
+        let chain_id = std::env::var("FAUCET_CHAIN_ID")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1);
+
+        let signer = PrivateKeySigner::from_str(&private_key)
+            .context("Invalid FAUCET_PRIVATE_KEY")?;
+
+        Ok(Self {
+            provider_url: rpc_url,
+            signer,
+            amount,
+            chain_id,
+        })
+    }
+
+    fn get_provider(&self) -> impl Provider<Ethereum> + '_ {
+        let url: url::Url = self.provider_url.parse().expect("Invalid URL");
+        ProviderBuilder::new().connect_http(url)
+    }
+
+    async fn send_funds(&self, to_addr: &str) -> anyhow::Result<alloy_primitives::B256> {
+        let to: Address = to_addr.parse().context("Invalid Core Lane address")?;
+        let provider = self.get_provider();
+        let from = self.signer.address();
+
+        // Get the chain ID from provider if not set, otherwise use configured
+        let chain_id = if self.chain_id == 0 {
+            provider
+                .get_chain_id()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to get chain ID: {}", e))?
+        } else {
+            self.chain_id
+        };
+
+        // Get nonce
+        let nonce = provider
+            .get_transaction_count(from)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to get transaction count: {}", e))?;
+
+        // Get gas price for EIP-1559
+        let gas_price = provider
+            .get_gas_price()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to get gas price: {}", e))?;
+
+        // For EIP-1559, use gas price as max_fee_per_gas and 10% as max_priority_fee_per_gas
+        let max_fee_per_gas = U256::from(gas_price).to::<u128>();
+        let max_priority_fee_per_gas = (U256::from(gas_price) / U256::from(10)).to::<u128>();
+
+        // Build the EIP-1559 transaction
+        let mut tx = TxEip1559 {
+            chain_id,
+            nonce,
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
+            gas_limit: 21000, // Standard transfer
+            to: alloy_primitives::TxKind::Call(to),
+            value: self.amount,
+            input: Bytes::new(),
+            access_list: Default::default(),
+        };
+
+        // Sign the transaction
+        let signature = self
+            .signer
+            .sign_transaction(&mut tx)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to sign transaction: {}", e))?;
+
+        // Create signed transaction envelope
+        let signed_tx = TxEnvelope::Eip1559(
+            alloy_consensus::Signed::new_unchecked(tx, signature, Default::default()),
+        );
+
+        // Encode the transaction
+        let mut encoded = Vec::new();
+        signed_tx.encode_2718(&mut encoded);
+        let tx_hex = format!("0x{}", hex::encode(&encoded));
+
+        // Send the raw transaction
+        let pending_tx = provider
+            .send_raw_transaction(&Bytes::from_str(&tx_hex)?)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to send transaction: {}", e))?;
+
+        Ok(*pending_tx.tx_hash())
+    }
+}
+
 struct Handler {
     member_role_id: RoleId,
     onboarding_channel_id: Option<ChannelId>,
     admin_channel_id: Option<ChannelId>,
+    funding_store: FundingStore,
+    faucet: Option<Faucet>,
+    _state: OnboardingState,
 }
 
 #[async_trait]
@@ -149,6 +362,62 @@ impl EventHandler for Handler {
                             return;
                         }
 
+                        // Faucet: attempt only once per Discord account
+                        let mut faucet_tx_hash: Option<alloy_primitives::B256> = None;
+                        let mut faucet_error: Option<String> = None;
+
+                        if let Some(faucet) = &self.faucet {
+                            match self.funding_store.has_funded(member.user.id.get()).await {
+                                Ok(true) => {
+                                    println!(
+                                        "Faucet: user {} already funded, skipping",
+                                        member.user.id
+                                    );
+                                }
+                                Ok(false) => {
+                                    if address.is_empty() {
+                                        eprintln!(
+                                            "Faucet: no address provided, skipping for user {}",
+                                            member.user.id
+                                        );
+                                        faucet_error = Some("No address provided".to_string());
+                                    } else {
+                                        println!(
+                                            "Faucet: sending laneBTC to {} for user {}",
+                                            address, member.user.id
+                                        );
+                                        match faucet.send_funds(&address).await {
+                                            Ok(tx) => {
+                                                println!("Faucet sent: tx hash {:?}", tx);
+                                                faucet_tx_hash = Some(tx);
+                                                if let Err(e) = self
+                                                    .funding_store
+                                                    .mark_funded(member.user.id.get())
+                                                    .await
+                                                {
+                                                    eprintln!(
+                                                        "Faucet: could not mark funded: {:?}",
+                                                        e
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                eprintln!(
+                                                    "Faucet error for user {}: {:?}",
+                                                    member.user.id, e
+                                                );
+                                                faucet_error = Some(format!("Failed to send laneBTC: {}", e));
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("Faucet: could not check funding store: {:?}", e);
+                                    faucet_error = Some("Failed to check funding status".to_string());
+                                }
+                            }
+                        }
+
                         // Assign the role
                         match member.add_role(&ctx.http, self.member_role_id).await {
                             Ok(_) => {
@@ -172,10 +441,24 @@ impl EventHandler for Handler {
                                     }
                                 }
 
-                                // Success response
+                                // Build success message with faucet info
+                                let mut success_msg = "**Onboarding Successful!**\n\nWelcome! You have been verified and given access to all channels.".to_string();
+
+                                if let Some(tx_hash) = faucet_tx_hash {
+                                    success_msg.push_str(&format!(
+                                        "\n\n✅ **laneBTC sent!** Transaction: `{:?}`",
+                                        tx_hash
+                                    ));
+                                } else if let Some(err) = faucet_error {
+                                    success_msg.push_str(&format!(
+                                        "\n\n⚠️ **Faucet issue:** {}",
+                                        err
+                                    ));
+                                }
+
                                 let response = CreateInteractionResponse::Message(
                                     CreateInteractionResponseMessage::new()
-                                        .content("**Onboarding Successful!**\n\nWelcome! You have been verified and given access to all channels.")
+                                        .content(success_msg)
                                         .ephemeral(true),
                                 );
 
@@ -248,6 +531,24 @@ async fn main() {
         println!("WARNING: ADMIN_CHANNEL_ID not set - admins will not see onboarding responses");
     }
 
+    let funding_store = FundingStore::new_from_env()
+        .await
+        .expect("Failed to initialise funding store (check FUNDING_BACKEND and S3 settings)");
+
+    let faucet = match Faucet::new_from_env().await {
+        Ok(f) => {
+            println!("Faucet configured: using FAUCET_RPC_URL and FAUCET_AMOUNT_WEI");
+            Some(f)
+        }
+        Err(e) => {
+            eprintln!(
+                "Faucet not configured or invalid: {:?}. Faucet will be disabled.",
+                e
+            );
+            None
+        }
+    };
+
     let intents = GatewayIntents::GUILD_MEMBERS
         | GatewayIntents::GUILDS
         | GatewayIntents::MESSAGE_CONTENT
@@ -257,6 +558,9 @@ async fn main() {
         member_role_id: RoleId::new(member_role_id),
         onboarding_channel_id,
         admin_channel_id,
+        funding_store,
+        faucet,
+        _state: Arc::new(RwLock::new(HashMap::new())),
     };
 
     let mut client = Client::builder(&token, intents)

@@ -3,13 +3,13 @@ use serenity::async_trait;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Mutex};
 
 use anyhow::Context as AnyhowContext;
 use alloy_primitives::{Address, Bytes, U256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_signer_local::PrivateKeySigner;
-use alloy_network::{Ethereum, TxSigner};
+use alloy_network::TxSigner;
 use alloy_consensus::{TxEip1559, TxEnvelope};
 use alloy_eips::eip2718::Encodable2718;
 use s3::creds::Credentials;
@@ -107,6 +107,7 @@ struct Faucet {
     signer: PrivateKeySigner,
     amount: U256,
     chain_id: u64,
+    nonce_tracker: Arc<Mutex<Option<u64>>>, // Track last known nonce
 }
 
 impl Faucet {
@@ -135,36 +136,69 @@ impl Faucet {
             signer,
             amount,
             chain_id,
+            nonce_tracker: Arc::new(Mutex::new(None)),
         })
-    }
-
-    fn get_provider(&self) -> impl Provider<Ethereum> + '_ {
-        ProviderBuilder::new().connect_http(self.provider_url.clone())
     }
 
     async fn send_funds(&self, to_addr: &str) -> anyhow::Result<alloy_primitives::B256> {
         let to: Address = to_addr.parse().context("Invalid Core Lane address")?;
-        let provider = self.get_provider();
+        let provider = ProviderBuilder::new().connect_http(self.provider_url.clone());
         let from = self.signer.address();
+
+        println!("Faucet: Checking balance for {:?}", from);
+        let balance = provider
+            .get_balance(from)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to get balance: {}", e))?;
+        println!("Faucet: Current balance: {} wei", balance);
+
+        // Calculate required amount: transfer amount + gas (21000 * gas_price)
+        let gas_limit = U256::from(21000u64);
+        let gas_price = U256::from(provider
+            .get_gas_price()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to get gas price: {}", e))?);
+        let gas_cost = gas_limit * gas_price;
+        let total_required = self.amount + gas_cost;
+
+        if balance < total_required {
+            return Err(anyhow::anyhow!(
+                "Insufficient balance: have {} wei, need {} wei (amount: {} + gas: {})",
+                balance, total_required, self.amount, gas_cost
+            ));
+        }
 
         // Use configured chain ID (Core Lane: 1281453634)
         let chain_id = self.chain_id;
 
-        // Get nonce
-        let nonce = provider
-            .get_transaction_count(from)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to get transaction count: {}", e))?;
+        // Get nonce with proper management
+        let nonce = {
+            let mut tracker = self.nonce_tracker.lock().await;
+            let on_chain_nonce = provider
+                .get_transaction_count(from)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to get transaction count: {}", e))?;
 
-        // Get gas price for EIP-1559
-        let gas_price = provider
-            .get_gas_price()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to get gas price: {}", e))?;
+            // Use the higher of on-chain nonce or tracked nonce + 1
+            let next_nonce = if let Some(tracked) = *tracker {
+                std::cmp::max(on_chain_nonce, tracked + 1)
+            } else {
+                on_chain_nonce
+            };
+
+            *tracker = Some(next_nonce);
+            println!("Faucet: Using nonce {}", next_nonce);
+            next_nonce
+        };
 
         // For EIP-1559, use gas price as max_fee_per_gas and 10% as max_priority_fee_per_gas
-        let max_fee_per_gas = U256::from(gas_price).to::<u128>();
-        let max_priority_fee_per_gas = (U256::from(gas_price) / U256::from(10)).to::<u128>();
+        let max_fee_per_gas = gas_price.to::<u128>();
+        let max_priority_fee_per_gas = (gas_price / U256::from(10)).to::<u128>();
+
+        println!(
+            "Faucet: Sending {} wei to {:?} with gas price {} wei",
+            self.amount, to, gas_price
+        );
 
         // Build the EIP-1559 transaction
         let mut tx = TxEip1559 {
@@ -196,13 +230,39 @@ impl Faucet {
         signed_tx.encode_2718(&mut encoded);
         let tx_hex = format!("0x{}", hex::encode(&encoded));
 
-        // Send the raw transaction
+        println!("Faucet: Broadcasting transaction...");
+        // Send the raw transaction using Alloy provider
         let pending_tx = provider
             .send_raw_transaction(&Bytes::from_str(&tx_hex)?)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to send transaction: {}", e))?;
+        let tx_hash = *pending_tx.tx_hash();
 
-        Ok(*pending_tx.tx_hash())
+        println!("Faucet: Transaction broadcast: {:?}", tx_hash);
+
+        // Wait for transaction confirmation
+        println!("Faucet: Waiting for transaction confirmation...");
+        for i in 0..30 {
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            if let Ok(Some(receipt)) = provider.get_transaction_receipt(tx_hash).await {
+                let status_ok = receipt.status();
+                println!(
+                    "Faucet: Transaction receipt received, status_ok: {}",
+                    status_ok
+                );
+                if status_ok {
+                    println!("Faucet: Transaction confirmed successfully!");
+                    break;
+                } else {
+                    return Err(anyhow::anyhow!("Transaction failed on-chain (status=false)"));
+                }
+            }
+            if i == 29 {
+                println!("Faucet: Warning: Transaction not confirmed after 30 seconds");
+            }
+        }
+
+        Ok(tx_hash)
     }
 }
 

@@ -7,6 +7,7 @@ use tokio::sync::{RwLock, Mutex};
 
 use anyhow::Context as AnyhowContext;
 use alloy_primitives::{Address, Bytes, U256};
+use alloy_provider::{Provider, ProviderBuilder};
 use alloy_signer_local::PrivateKeySigner;
 use alloy_network::TxSigner;
 use alloy_consensus::{TxEip1559, TxEnvelope};
@@ -106,7 +107,6 @@ struct Faucet {
     signer: PrivateKeySigner,
     amount: U256,
     chain_id: u64,
-    http_client: reqwest::Client,
     nonce_tracker: Arc<Mutex<Option<u64>>>, // Track last known nonce
 }
 
@@ -136,103 +136,28 @@ impl Faucet {
             signer,
             amount,
             chain_id,
-            http_client: reqwest::Client::new(),
             nonce_tracker: Arc::new(Mutex::new(None)),
         })
     }
 
-    async fn rpc_call(&self, method: &str, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
-        let payload = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": method,
-            "params": params
-        });
-
-        let response = self.http_client
-            .post(self.provider_url.as_str())
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("RPC request failed: {}", e))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            return Err(anyhow::anyhow!("RPC error: HTTP {} with empty body", status));
-        }
-
-        let json: serde_json::Value = response.json().await
-            .map_err(|e| anyhow::anyhow!("Failed to parse RPC response: {}", e))?;
-
-        if let Some(error) = json.get("error") {
-            return Err(anyhow::anyhow!("RPC error: {}", error));
-        }
-
-        json.get("result")
-            .ok_or_else(|| anyhow::anyhow!("RPC response missing 'result' field"))
-            .map(|v| v.clone())
-    }
-
-    async fn get_balance(&self, address: Address) -> anyhow::Result<U256> {
-        let params = serde_json::json!([format!("{}", address), "latest"]);
-        let result = self.rpc_call("eth_getBalance", params).await?;
-        let balance_str = result.as_str()
-            .ok_or_else(|| anyhow::anyhow!("Invalid balance response"))?;
-        let balance = U256::from_str_radix(&balance_str[2..], 16)
-            .map_err(|e| anyhow::anyhow!("Failed to parse balance: {}", e))?;
-        Ok(balance)
-    }
-
-    async fn get_transaction_count(&self, address: Address) -> anyhow::Result<u64> {
-        let params = serde_json::json!([format!("{}", address), "latest"]);
-        let result = self.rpc_call("eth_getTransactionCount", params).await?;
-        let nonce_str = result.as_str()
-            .ok_or_else(|| anyhow::anyhow!("Invalid nonce response"))?;
-        let nonce = u64::from_str_radix(&nonce_str[2..], 16)
-            .map_err(|e| anyhow::anyhow!("Failed to parse nonce: {}", e))?;
-        Ok(nonce)
-    }
-
-    async fn get_gas_price(&self) -> anyhow::Result<U256> {
-        let result = self.rpc_call("eth_gasPrice", serde_json::json!([])).await?;
-        let gas_str = result.as_str()
-            .ok_or_else(|| anyhow::anyhow!("Invalid gas price response"))?;
-        let gas = U256::from_str_radix(&gas_str[2..], 16)
-            .map_err(|e| anyhow::anyhow!("Failed to parse gas price: {}", e))?;
-        Ok(gas)
-    }
-
-    async fn send_raw_transaction(&self, tx_hex: &str) -> anyhow::Result<alloy_primitives::B256> {
-        let params = serde_json::json!([tx_hex]);
-        let result = self.rpc_call("eth_sendRawTransaction", params).await?;
-        let tx_hash_str = result.as_str()
-            .ok_or_else(|| anyhow::anyhow!("Invalid tx hash response"))?;
-        let tx_hash = alloy_primitives::B256::from_str(&tx_hash_str)
-            .map_err(|e| anyhow::anyhow!("Failed to parse tx hash: {}", e))?;
-        Ok(tx_hash)
-    }
-
-    async fn get_transaction_receipt(&self, tx_hash: &alloy_primitives::B256) -> anyhow::Result<Option<serde_json::Value>> {
-        let params = serde_json::json!([format!("0x{}", hex::encode(tx_hash.as_slice()))]);
-        let result = self.rpc_call("eth_getTransactionReceipt", params).await?;
-        if result.is_null() {
-            Ok(None)
-        } else {
-            Ok(Some(result))
-        }
-    }
-
     async fn send_funds(&self, to_addr: &str) -> anyhow::Result<alloy_primitives::B256> {
         let to: Address = to_addr.parse().context("Invalid Core Lane address")?;
+        let provider = ProviderBuilder::new().connect_http(self.provider_url.clone());
         let from = self.signer.address();
 
         println!("Faucet: Checking balance for {:?}", from);
-        let balance = self.get_balance(from).await?;
+        let balance = provider
+            .get_balance(from)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to get balance: {}", e))?;
         println!("Faucet: Current balance: {} wei", balance);
 
         // Calculate required amount: transfer amount + gas (21000 * gas_price)
         let gas_limit = U256::from(21000u64);
-        let gas_price = self.get_gas_price().await?;
+        let gas_price = U256::from(provider
+            .get_gas_price()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to get gas price: {}", e))?);
         let gas_cost = gas_limit * gas_price;
         let total_required = self.amount + gas_cost;
 
@@ -249,7 +174,9 @@ impl Faucet {
         // Get nonce with proper management
         let nonce = {
             let mut tracker = self.nonce_tracker.lock().await;
-            let on_chain_nonce = self.get_transaction_count(from).await
+            let on_chain_nonce = provider
+                .get_transaction_count(from)
+                .await
                 .map_err(|e| anyhow::anyhow!("Failed to get transaction count: {}", e))?;
 
             // Use the higher of on-chain nonce or tracked nonce + 1
@@ -268,7 +195,10 @@ impl Faucet {
         let max_fee_per_gas = gas_price.to::<u128>();
         let max_priority_fee_per_gas = (gas_price / U256::from(10)).to::<u128>();
 
-        println!("Faucet: Sending {} wei to {:?} with gas price {} wei", self.amount, to, gas_price);
+        println!(
+            "Faucet: Sending {} wei to {:?} with gas price {} wei",
+            self.amount, to, gas_price
+        );
 
         // Build the EIP-1559 transaction
         let mut tx = TxEip1559 {
@@ -301,9 +231,12 @@ impl Faucet {
         let tx_hex = format!("0x{}", hex::encode(&encoded));
 
         println!("Faucet: Broadcasting transaction...");
-        // Send the raw transaction using direct RPC
-        let tx_hash = self.send_raw_transaction(&tx_hex).await
+        // Send the raw transaction using Alloy provider
+        let pending_tx = provider
+            .send_raw_transaction(&Bytes::from_str(&tx_hex)?)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to send transaction: {}", e))?;
+        let tx_hash = *pending_tx.tx_hash();
 
         println!("Faucet: Transaction broadcast: {:?}", tx_hash);
 
@@ -311,16 +244,17 @@ impl Faucet {
         println!("Faucet: Waiting for transaction confirmation...");
         for i in 0..30 {
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-            if let Ok(Some(receipt)) = self.get_transaction_receipt(&tx_hash).await {
-                let status = receipt.get("status")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("unknown");
-                println!("Faucet: Transaction receipt received, status: {}", status);
-                if status == "0x1" || status == "0x01" {
+            if let Ok(Some(receipt)) = provider.get_transaction_receipt(tx_hash).await {
+                let status_ok = receipt.status();
+                println!(
+                    "Faucet: Transaction receipt received, status_ok: {}",
+                    status_ok
+                );
+                if status_ok {
                     println!("Faucet: Transaction confirmed successfully!");
                     break;
                 } else {
-                    return Err(anyhow::anyhow!("Transaction failed on-chain: status {}", status));
+                    return Err(anyhow::anyhow!("Transaction failed on-chain (status=false)"));
                 }
             }
             if i == 29 {

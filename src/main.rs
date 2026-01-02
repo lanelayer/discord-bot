@@ -7,7 +7,6 @@ use tokio::sync::{RwLock, Mutex};
 
 use anyhow::Context as AnyhowContext;
 use alloy_primitives::{Address, Bytes, U256};
-use alloy_provider::{Provider, ProviderBuilder};
 use alloy_signer_local::PrivateKeySigner;
 use alloy_network::TxSigner;
 use alloy_consensus::{TxEip1559, TxEnvelope};
@@ -107,6 +106,7 @@ struct Faucet {
     signer: PrivateKeySigner,
     amount: U256,
     chain_id: u64,
+    http_client: reqwest::Client,
     nonce_tracker: Arc<Mutex<Option<u64>>>, // Track last known nonce
 }
 
@@ -136,28 +136,103 @@ impl Faucet {
             signer,
             amount,
             chain_id,
+            http_client: reqwest::Client::new(),
             nonce_tracker: Arc::new(Mutex::new(None)),
         })
     }
 
+    async fn rpc_call(&self, method: &str, params: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params
+        });
+
+        let response = self.http_client
+            .post(self.provider_url.as_str())
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("RPC request failed: {}", e))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            return Err(anyhow::anyhow!("RPC error: HTTP {} with empty body", status));
+        }
+
+        let json: serde_json::Value = response.json().await
+            .map_err(|e| anyhow::anyhow!("Failed to parse RPC response: {}", e))?;
+
+        if let Some(error) = json.get("error") {
+            return Err(anyhow::anyhow!("RPC error: {}", error));
+        }
+
+        json.get("result")
+            .ok_or_else(|| anyhow::anyhow!("RPC response missing 'result' field"))
+            .map(|v| v.clone())
+    }
+
+    async fn get_balance(&self, address: Address) -> anyhow::Result<U256> {
+        let params = serde_json::json!([format!("{}", address), "latest"]);
+        let result = self.rpc_call("eth_getBalance", params).await?;
+        let balance_str = result.as_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid balance response"))?;
+        let balance = U256::from_str_radix(&balance_str[2..], 16)
+            .map_err(|e| anyhow::anyhow!("Failed to parse balance: {}", e))?;
+        Ok(balance)
+    }
+
+    async fn get_transaction_count(&self, address: Address) -> anyhow::Result<u64> {
+        let params = serde_json::json!([format!("{}", address), "latest"]);
+        let result = self.rpc_call("eth_getTransactionCount", params).await?;
+        let nonce_str = result.as_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid nonce response"))?;
+        let nonce = u64::from_str_radix(&nonce_str[2..], 16)
+            .map_err(|e| anyhow::anyhow!("Failed to parse nonce: {}", e))?;
+        Ok(nonce)
+    }
+
+    async fn get_gas_price(&self) -> anyhow::Result<U256> {
+        let result = self.rpc_call("eth_gasPrice", serde_json::json!([])).await?;
+        let gas_str = result.as_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid gas price response"))?;
+        let gas = U256::from_str_radix(&gas_str[2..], 16)
+            .map_err(|e| anyhow::anyhow!("Failed to parse gas price: {}", e))?;
+        Ok(gas)
+    }
+
+    async fn send_raw_transaction(&self, tx_hex: &str) -> anyhow::Result<alloy_primitives::B256> {
+        let params = serde_json::json!([tx_hex]);
+        let result = self.rpc_call("eth_sendRawTransaction", params).await?;
+        let tx_hash_str = result.as_str()
+            .ok_or_else(|| anyhow::anyhow!("Invalid tx hash response"))?;
+        let tx_hash = alloy_primitives::B256::from_str(&tx_hash_str)
+            .map_err(|e| anyhow::anyhow!("Failed to parse tx hash: {}", e))?;
+        Ok(tx_hash)
+    }
+
+    async fn get_transaction_receipt(&self, tx_hash: &alloy_primitives::B256) -> anyhow::Result<Option<serde_json::Value>> {
+        let params = serde_json::json!([format!("0x{}", hex::encode(tx_hash.as_slice()))]);
+        let result = self.rpc_call("eth_getTransactionReceipt", params).await?;
+        if result.is_null() {
+            Ok(None)
+        } else {
+            Ok(Some(result))
+        }
+    }
+
     async fn send_funds(&self, to_addr: &str) -> anyhow::Result<alloy_primitives::B256> {
         let to: Address = to_addr.parse().context("Invalid Core Lane address")?;
-        let provider = ProviderBuilder::new().connect_http(self.provider_url.clone());
         let from = self.signer.address();
 
         println!("Faucet: Checking balance for {:?}", from);
-        let balance = provider
-            .get_balance(from)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to get balance: {}", e))?;
+        let balance = self.get_balance(from).await?;
         println!("Faucet: Current balance: {} wei", balance);
 
         // Calculate required amount: transfer amount + gas (21000 * gas_price)
         let gas_limit = U256::from(21000u64);
-        let gas_price = U256::from(provider
-            .get_gas_price()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to get gas price: {}", e))?);
+        let gas_price = self.get_gas_price().await?;
         let gas_cost = gas_limit * gas_price;
         let total_required = self.amount + gas_cost;
 
@@ -172,22 +247,26 @@ impl Faucet {
         let chain_id = self.chain_id;
 
         // Get nonce with proper management
+        // Always use the on-chain nonce to avoid conflicts with pending transactions
         let nonce = {
-            let mut tracker = self.nonce_tracker.lock().await;
-            let on_chain_nonce = provider
-                .get_transaction_count(from)
-                .await
+            let on_chain_nonce = self.get_transaction_count(from).await
                 .map_err(|e| anyhow::anyhow!("Failed to get transaction count: {}", e))?;
 
-            // Use the higher of on-chain nonce or tracked nonce + 1
+            // Check if we have a tracked nonce that's higher (shouldn't happen, but safety check)
+            let tracker = self.nonce_tracker.lock().await;
             let next_nonce = if let Some(tracked) = *tracker {
-                std::cmp::max(on_chain_nonce, tracked + 1)
+                // Use the higher of on-chain or tracked+1, but prefer on-chain for safety
+                if on_chain_nonce > tracked {
+                    on_chain_nonce
+                } else {
+                    tracked + 1
+                }
             } else {
                 on_chain_nonce
             };
 
-            *tracker = Some(next_nonce);
-            println!("Faucet: Using nonce {}", next_nonce);
+            println!("Faucet: Using nonce {} (on-chain: {}, tracked: {:?})",
+                next_nonce, on_chain_nonce, *tracker);
             next_nonce
         };
 
@@ -195,10 +274,7 @@ impl Faucet {
         let max_fee_per_gas = gas_price.to::<u128>();
         let max_priority_fee_per_gas = (gas_price / U256::from(10)).to::<u128>();
 
-        println!(
-            "Faucet: Sending {} wei to {:?} with gas price {} wei",
-            self.amount, to, gas_price
-        );
+        println!("Faucet: Sending {} wei to {:?} with gas price {} wei", self.amount, to, gas_price);
 
         // Build the EIP-1559 transaction
         let mut tx = TxEip1559 {
@@ -231,35 +307,41 @@ impl Faucet {
         let tx_hex = format!("0x{}", hex::encode(&encoded));
 
         println!("Faucet: Broadcasting transaction...");
-        // Send the raw transaction using Alloy provider
-        let pending_tx = provider
-            .send_raw_transaction(&Bytes::from_str(&tx_hex)?)
-            .await
+        // Send the raw transaction using direct RPC
+        let tx_hash = self.send_raw_transaction(&tx_hex).await
             .map_err(|e| anyhow::anyhow!("Failed to send transaction: {}", e))?;
-        let tx_hash = *pending_tx.tx_hash();
 
         println!("Faucet: Transaction broadcast: {:?}", tx_hash);
 
         // Wait for transaction confirmation
         println!("Faucet: Waiting for transaction confirmation...");
+        let mut confirmed = false;
         for i in 0..30 {
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-            if let Ok(Some(receipt)) = provider.get_transaction_receipt(tx_hash).await {
-                let status_ok = receipt.status();
-                println!(
-                    "Faucet: Transaction receipt received, status_ok: {}",
-                    status_ok
-                );
-                if status_ok {
+            if let Ok(Some(receipt)) = self.get_transaction_receipt(&tx_hash).await {
+                let status = receipt.get("status")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("unknown");
+                println!("Faucet: Transaction receipt received, status: {}", status);
+                if status == "0x1" || status == "0x01" {
                     println!("Faucet: Transaction confirmed successfully!");
+                    confirmed = true;
+                    // Update nonce tracker only after successful confirmation
+                    let mut tracker = self.nonce_tracker.lock().await;
+                    *tracker = Some(nonce);
+                    println!("Faucet: Updated nonce tracker to {}", nonce);
                     break;
                 } else {
-                    return Err(anyhow::anyhow!("Transaction failed on-chain (status=false)"));
+                    return Err(anyhow::anyhow!("Transaction failed on-chain: status {}", status));
                 }
             }
             if i == 29 {
                 println!("Faucet: Warning: Transaction not confirmed after 30 seconds");
             }
+        }
+
+        if !confirmed {
+            return Err(anyhow::anyhow!("Transaction not confirmed within timeout period"));
         }
 
         Ok(tx_hash)
@@ -272,6 +354,7 @@ struct Handler {
     admin_channel_id: Option<ChannelId>,
     funding_store: FundingStore,
     faucet: Option<Faucet>,
+    faucet_init_error: Option<String>,
     _state: OnboardingState,
 }
 
@@ -401,30 +484,66 @@ impl EventHandler for Handler {
                 let why_joined = why_joined.trim().to_string();
                 let address = address.trim().to_string();
 
-                // Get the guild and check if user already has the role (idempotency guard)
+                // RESPOND IMMEDIATELY to avoid Discord timeout (must be within 3 seconds)
+                let initial_msg = "**Processing your onboarding...**\n\nPlease wait while we verify and set up your account.";
+                let response = CreateInteractionResponse::Message(
+                    CreateInteractionResponseMessage::new()
+                        .content(initial_msg)
+                        .ephemeral(true),
+                );
+
+                if let Err(e) = modal.create_response(&ctx.http, response).await {
+                    eprintln!("Error responding to form: {:?}", e);
+                    return;
+                }
+
+                // Now do all the work in the background
                 if let Some(guild_id) = modal.guild_id {
-                    if let Ok(member) = guild_id.member(&ctx.http, modal.user.id).await {
-                        // Check if user already has the role
-                        if member.roles.contains(&self.member_role_id) {
-                            let response = CreateInteractionResponse::Message(
-                                CreateInteractionResponseMessage::new()
-                                    .content("You are already verified! You have access to all channels.")
-                                    .ephemeral(true),
-                            );
-                            if let Err(e) = modal.create_response(&ctx.http, response).await {
-                                eprintln!("Error responding to already-verified user: {:?}", e);
+                    let ctx_clone = ctx.clone();
+                    let modal_clone = modal.clone();
+                    let member_role_id = self.member_role_id;
+                    let admin_channel_id = self.admin_channel_id;
+                    let funding_store_clone = self.funding_store.clone();
+                    let faucet_clone = self.faucet.clone();
+                    let faucet_error_msg = self.faucet_init_error.clone();
+                    let user_id = modal.user.id;
+                    let why_joined_clone = why_joined.clone();
+                    let address_clone = address.clone();
+
+                    tokio::spawn(async move {
+                        // Get the guild member
+                        let member = match guild_id.member(&ctx_clone.http, user_id).await {
+                            Ok(m) => m,
+                            Err(e) => {
+                                eprintln!("Error getting member: {:?}", e);
+                                let _ = modal_clone.create_followup(
+                                    &ctx_clone.http,
+                                    CreateInteractionResponseFollowup::new()
+                                        .content("❌ Error: Could not retrieve your member information. Please contact an administrator.")
+                                        .ephemeral(true)
+                                ).await;
+                                return;
                             }
+                        };
+
+                        // Check if user already has the role
+                        if member.roles.contains(&member_role_id) {
+                            let _ = modal_clone.create_followup(
+                                &ctx_clone.http,
+                                CreateInteractionResponseFollowup::new()
+                                    .content("You are already verified! You have access to all channels.")
+                                    .ephemeral(true)
+                            ).await;
                             return;
                         }
 
-                        // Assign the role first (fast operation)
-                        let role_result = member.add_role(&ctx.http, self.member_role_id).await;
-                        match role_result {
+                        // Assign the role
+                        match member.add_role(&ctx_clone.http, member_role_id).await {
                             Ok(_) => {
-                                println!("Assigned role {} to {}", self.member_role_id, member.user.name);
+                                println!("Assigned role {} to {}", member_role_id, member.user.name);
 
                                 // Log to admin channel
-                                if let Some(admin_channel) = self.admin_channel_id {
+                                if let Some(admin_channel) = admin_channel_id {
                                     let admin_message = format!(
                                         "**New Member Onboarded**\n\
                                         **User:** {} ({})\n\
@@ -432,134 +551,118 @@ impl EventHandler for Handler {
                                         **Core Lane Address:** {}",
                                         member.user.name,
                                         member.user.id,
-                                        if why_joined.is_empty() { "Not provided" } else { &why_joined },
-                                        if address.is_empty() { "Not provided" } else { &address },
+                                        if why_joined_clone.is_empty() { "Not provided" } else { &why_joined_clone },
+                                        if address_clone.is_empty() { "Not provided" } else { &address_clone },
                                     );
 
-                                    if let Err(e) = admin_channel.say(&ctx.http, admin_message).await {
+                                    if let Err(e) = admin_channel.say(&ctx_clone.http, admin_message).await {
                                         eprintln!("Failed to send admin onboarding message: {:?}", e);
                                     }
                                 }
 
-                                // Respond immediately to avoid interaction timeout
-                                let initial_msg = "**Onboarding Successful!**\n\nWelcome! You have been verified and given access to all channels.\n\nProcessing laneBTC faucet...";
-                                let response = CreateInteractionResponse::Message(
-                                    CreateInteractionResponseMessage::new()
-                                        .content(initial_msg)
-                                        .ephemeral(true),
-                                );
+                                // Update the initial message with success
+                                let success_msg = "**Onboarding Successful!**\n\nWelcome! You have been verified and given access to all channels.\n\nProcessing laneBTC faucet...";
+                                let _ = modal_clone.edit_response(
+                                    &ctx_clone.http,
+                                    EditInteractionResponse::new().content(success_msg)
+                                ).await;
 
-                                if let Err(e) = modal.create_response(&ctx.http, response).await {
-                                    eprintln!("Error responding to form: {:?}", e);
-                                    return;
-                                }
+                                // Handle faucet
+                                let mut faucet_tx_hash: Option<alloy_primitives::B256> = None;
+                                let mut faucet_error: Option<String> = None;
 
-                                // Handle faucet in background and send follow-up
-                                let ctx_clone = ctx.clone();
-                                let modal_clone = modal.clone();
-                                let faucet_clone = self.faucet.clone();
-                                let funding_store_clone = self.funding_store.clone();
-                                let user_id = member.user.id;
-                                let address_clone = address.clone();
-
-                                tokio::spawn(async move {
-                                    let mut faucet_tx_hash: Option<alloy_primitives::B256> = None;
-                                    let mut faucet_error: Option<String> = None;
-
-                                    if let Some(faucet) = &faucet_clone {
-                                        match funding_store_clone.has_funded(user_id.get()).await {
-                                            Ok(true) => {
-                                                println!(
-                                                    "Faucet: user {} already funded, skipping",
+                                if let Some(faucet) = &faucet_clone {
+                                    match funding_store_clone.has_funded(user_id.get()).await {
+                                        Ok(true) => {
+                                            println!(
+                                                "Faucet: user {} already funded, skipping",
+                                                user_id
+                                            );
+                                        }
+                                        Ok(false) => {
+                                            if address_clone.is_empty() {
+                                                eprintln!(
+                                                    "Faucet: no address provided, skipping for user {}",
                                                     user_id
                                                 );
-                                            }
-                                            Ok(false) => {
-                                                if address_clone.is_empty() {
-                                                    eprintln!(
-                                                        "Faucet: no address provided, skipping for user {}",
-                                                        user_id
-                                                    );
-                                                    faucet_error = Some("No address provided".to_string());
-                                                } else {
-                                                    println!(
-                                                        "Faucet: sending laneBTC to {} for user {}",
-                                                        address_clone, user_id
-                                                    );
-                                                    match faucet.send_funds(&address_clone).await {
-                                                        Ok(tx) => {
-                                                            println!("Faucet sent: tx hash {:?}", tx);
-                                                            faucet_tx_hash = Some(tx);
-                                                            if let Err(e) = funding_store_clone
-                                                                .mark_funded(user_id.get())
-                                                                .await
-                                                            {
-                                                                eprintln!(
-                                                                    "Faucet: could not mark funded: {:?}",
-                                                                    e
-                                                                );
-                                                            }
-                                                        }
-                                                        Err(e) => {
+                                                faucet_error = Some("No address provided".to_string());
+                                            } else {
+                                                println!(
+                                                    "Faucet: sending laneBTC to {} for user {}",
+                                                    address_clone, user_id
+                                                );
+                                                match faucet.send_funds(&address_clone).await {
+                                                    Ok(tx) => {
+                                                        println!("Faucet sent: tx hash {:?}", tx);
+                                                        faucet_tx_hash = Some(tx);
+                                                        if let Err(e) = funding_store_clone
+                                                            .mark_funded(user_id.get())
+                                                            .await
+                                                        {
                                                             eprintln!(
-                                                                "Faucet error for user {}: {:?}",
-                                                                user_id, e
+                                                                "Faucet: could not mark funded: {:?}",
+                                                                e
                                                             );
-                                                            faucet_error = Some(format!("Failed to send laneBTC: {}", e));
                                                         }
+                                                    }
+                                                    Err(e) => {
+                                                        eprintln!(
+                                                            "Faucet error for user {}: {:?}",
+                                                            user_id, e
+                                                        );
+                                                        faucet_error = Some(format!("Failed to send laneBTC: {}", e));
                                                     }
                                                 }
                                             }
-                                            Err(e) => {
-                                                eprintln!("Faucet: could not check funding store: {:?}", e);
-                                                faucet_error = Some("Failed to check funding status".to_string());
-                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!("Faucet: could not check funding store: {:?}", e);
+                                            faucet_error = Some("Failed to check funding status".to_string());
                                         }
                                     }
+                                }
 
-                                    // Build follow-up message
-                                    let followup_msg = if let Some(tx_hash) = faucet_tx_hash {
-                                        format!(
-                                            "✅ **laneBTC sent!** Transaction: `{:?}`",
-                                            tx_hash
-                                        )
-                                    } else if let Some(err) = faucet_error {
-                                        format!("⚠️ **Faucet issue:** {}", err)
-                                    } else {
-                                        "ℹ️ Faucet not configured.".to_string()
-                                    };
+                                // Build follow-up message
+                                let followup_msg = if let Some(tx_hash) = faucet_tx_hash {
+                                    format!(
+                                        "✅ **laneBTC sent!** Transaction: `{:?}`",
+                                        tx_hash
+                                    )
+                                } else if let Some(err) = faucet_error {
+                                    format!("⚠️ **Faucet issue:** {}", err)
+                                } else if let Some(init_err) = faucet_error_msg {
+                                    format!("⚠️ **Faucet not configured:** {}", init_err)
+                                } else {
+                                    "ℹ️ Faucet not configured. Please check environment variables: FAUCET_RPC_URL, FAUCET_PRIVATE_KEY, FAUCET_AMOUNT_WEI".to_string()
+                                };
 
-                                    // Send follow-up message
-                                    if let Err(e) = modal_clone
-                                        .create_followup(&ctx_clone.http, CreateInteractionResponseFollowup::new().content(followup_msg).ephemeral(true))
-                                        .await
-                                    {
-                                        eprintln!("Error sending follow-up message: {:?}", e);
-                                    }
-                                });
+                                // Send follow-up message
+                                if let Err(e) = modal_clone
+                                    .create_followup(&ctx_clone.http, CreateInteractionResponseFollowup::new().content(followup_msg).ephemeral(true))
+                                    .await
+                                {
+                                    eprintln!("Error sending follow-up message: {:?}", e);
+                                }
                             }
                             Err(e) => {
                                 eprintln!("Error assigning role: {:?}", e);
                                 eprintln!("User: {} ({})", member.user.name, member.user.id);
-                                eprintln!("Role ID: {}", self.member_role_id);
+                                eprintln!("Role ID: {}", member_role_id);
 
                                 let error_msg = format!(
-                                    "Error assigning role. Please contact an administrator.\n\nError: {}",
+                                    "❌ **Error assigning role.** Please contact an administrator.\n\nError: {}",
                                     e
                                 );
 
-                                let response = CreateInteractionResponse::Message(
-                                    CreateInteractionResponseMessage::new()
+                                let _ = modal_clone.create_followup(
+                                    &ctx_clone.http,
+                                    CreateInteractionResponseFollowup::new()
                                         .content(error_msg)
-                                        .ephemeral(true),
-                                );
-
-                                if let Err(send_err) = modal.create_response(&ctx.http, response).await {
-                                    eprintln!("Failed to send error message: {:?}", send_err);
-                                }
+                                        .ephemeral(true)
+                                ).await;
                             }
                         }
-                    }
+                    });
                 }
             }
         }
@@ -607,17 +710,18 @@ async fn main() {
         .await
         .expect("Failed to initialise funding store (check FUNDING_BACKEND and S3 settings)");
 
-    let faucet = match Faucet::new_from_env().await {
+    let (faucet, faucet_init_error) = match Faucet::new_from_env().await {
         Ok(f) => {
             println!("Faucet configured: using FAUCET_RPC_URL and FAUCET_AMOUNT_WEI");
-            Some(f)
+            (Some(f), None)
         }
         Err(e) => {
+            let error_msg = format!("{:?}", e);
             eprintln!(
-                "Faucet not configured or invalid: {:?}. Faucet will be disabled.",
-                e
+                "Faucet not configured or invalid: {}. Faucet will be disabled.",
+                error_msg
             );
-            None
+            (None, Some(error_msg))
         }
     };
 
@@ -632,6 +736,7 @@ async fn main() {
         admin_channel_id,
         funding_store,
         faucet,
+        faucet_init_error,
         _state: Arc::new(RwLock::new(HashMap::new())),
     };
 

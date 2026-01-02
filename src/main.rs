@@ -152,9 +152,7 @@ impl Faucet {
 
         // Create Alloy provider
         let provider = ProviderBuilder::new()
-            .connect_http(provider_url)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to connect to RPC: {}", e))?;
+            .connect_http(provider_url);
 
         Ok(Self {
             provider,

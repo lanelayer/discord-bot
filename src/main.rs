@@ -152,7 +152,7 @@ impl Faucet {
 
         // Create Alloy provider
         let provider = ProviderBuilder::new()
-            .on_http(provider_url);
+            .connect_http(provider_url);
 
         Ok(Self {
             provider,

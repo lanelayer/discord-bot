@@ -190,22 +190,22 @@ impl Faucet {
         // Use configured chain ID (Core Lane: 1281453634)
         let chain_id = self.chain_id;
 
-        // Get nonce with proper management
-        // Always use the on-chain nonce to avoid conflicts with pending transactions
+        // Get nonce with proper management using Alloy and our tracker
+        // We track nonces of transactions we've sent to ensure sequential ordering
         let nonce = {
+            let tracker = self.nonce_tracker.lock().await;
+
+            // Get on-chain nonce using Alloy provider
             let on_chain_nonce = self.provider.get_transaction_count(from).await
                 .map_err(|e| anyhow::anyhow!("Failed to get transaction count: {}", e))?;
 
-            // Check if we have a tracked nonce that's higher (shouldn't happen, but safety check)
-            let tracker = self.nonce_tracker.lock().await;
+            // Determine the next nonce to use
             let next_nonce = if let Some(tracked) = *tracker {
-                // Use the higher of on-chain or tracked+1, but prefer on-chain for safety
-                if on_chain_nonce > tracked {
-                    on_chain_nonce
-                } else {
-                    tracked + 1
-                }
+                // We have sent transactions before - use tracked + 1
+                // But ensure it's at least as high as on-chain (safety check)
+                std::cmp::max(tracked + 1, on_chain_nonce)
             } else {
+                // First transaction - use on-chain nonce
                 on_chain_nonce
             };
 
@@ -252,11 +252,26 @@ impl Faucet {
 
         println!("Faucet: Broadcasting transaction...");
         // Send the raw transaction using Alloy provider
-        let pending_tx = self.provider.send_raw_transaction(&tx_bytes).await
-            .map_err(|e| anyhow::anyhow!("Failed to send transaction: {}", e))?;
+        let pending_tx = match self.provider.send_raw_transaction(&tx_bytes).await {
+            Ok(tx) => tx,
+            Err(e) => {
+                // Transaction send failed - don't update nonce tracker
+                // The nonce we calculated is still available for retry
+                return Err(anyhow::anyhow!("Failed to send transaction: {}", e));
+            }
+        };
 
         let tx_hash = *pending_tx.tx_hash();
         println!("Faucet: Transaction broadcast: {:?}", tx_hash);
+
+        // Update nonce tracker now that we've successfully sent the transaction
+        // This ensures we track all sent transactions for proper nonce sequencing
+        // Even if the transaction later fails on-chain, we've used this nonce
+        {
+            let mut tracker = self.nonce_tracker.lock().await;
+            *tracker = Some(nonce);
+            println!("Faucet: Updated nonce tracker to {} after successful send", nonce);
+        }
 
         // Wait for transaction confirmation
         println!("Faucet: Waiting for transaction confirmation...");
@@ -269,10 +284,7 @@ impl Faucet {
                 if status_ok {
                     println!("Faucet: Transaction confirmed successfully!");
                     confirmed = true;
-                    // Update nonce tracker only after successful confirmation
-                    let mut tracker = self.nonce_tracker.lock().await;
-                    *tracker = Some(nonce);
-                    println!("Faucet: Updated nonce tracker to {}", nonce);
+                    // Nonce tracker was already updated when we sent the transaction
                     break;
                 } else {
                     return Err(anyhow::anyhow!("Transaction failed on-chain"));
@@ -336,18 +348,18 @@ impl EventHandler for Handler {
 
             // Create welcome message if it doesn't exist
             if !has_welcome_message {
-                let components = vec![CreateActionRow::Buttons(vec![
-                    CreateButton::new("start_onboarding")
-                        .label("Start Onboarding")
-                        .style(ButtonStyle::Primary),
-                ])];
+            let components = vec![CreateActionRow::Buttons(vec![
+                CreateButton::new("start_onboarding")
+                    .label("Start Onboarding")
+                    .style(ButtonStyle::Primary),
+            ])];
 
-                let message = CreateMessage::new()
-                    .content(welcome_message)
-                    .components(components);
+            let message = CreateMessage::new()
+                .content(welcome_message)
+                .components(components);
 
-                match onboarding_channel.send_message(&ctx.http, message).await {
-                    Ok(msg) => {
+            match onboarding_channel.send_message(&ctx.http, message).await {
+                Ok(msg) => {
                         println!("Posted welcome message (ID: {})", msg.id);
                         if let Err(e) = msg.pin(&ctx.http).await {
                             eprintln!("Could not pin welcome message: {:?}", e);

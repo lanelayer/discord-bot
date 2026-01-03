@@ -273,10 +273,10 @@ impl Faucet {
             println!("Faucet: Updated nonce tracker to {} after successful send", nonce);
         }
 
-        // Wait for transaction confirmation
+        // Wait for transaction confirmation (increased timeout to 60 seconds for slow networks)
         println!("Faucet: Waiting for transaction confirmation...");
         let mut confirmed = false;
-        for i in 0..30 {
+        for i in 0..60 {
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             if let Ok(Some(receipt)) = self.provider.get_transaction_receipt(tx_hash).await {
                 let status_ok = receipt.status();
@@ -290,13 +290,18 @@ impl Faucet {
                     return Err(anyhow::anyhow!("Transaction failed on-chain"));
                 }
             }
-            if i == 29 {
-                println!("Faucet: Warning: Transaction not confirmed after 30 seconds");
+            if i == 29 || i == 59 {
+                println!("Faucet: Still waiting for confirmation... ({} seconds elapsed)", i + 1);
             }
         }
 
         if !confirmed {
-            return Err(anyhow::anyhow!("Transaction not confirmed within timeout period"));
+            // Transaction not confirmed - return error with tx_hash for manual verification
+            // DO NOT mark user as funded if transaction is not confirmed
+            return Err(anyhow::anyhow!(
+                "Transaction not confirmed within timeout period (60 seconds). Transaction hash: {:?}. The transaction may still be pending. Please verify manually.",
+                tx_hash
+            ));
         }
 
         Ok(tx_hash)
@@ -570,30 +575,98 @@ impl EventHandler for Handler {
                                                 );
                                                 faucet_error = Some("No address provided".to_string());
                                             } else {
-                                                println!(
-                                                    "Faucet: sending laneBTC to {} for user {}",
-                                                    address_clone, user_id
-                                                );
-                                                match faucet.send_funds(&address_clone).await {
-                                                    Ok(tx) => {
-                                                        println!("Faucet sent: tx hash {:?}", tx);
-                                                        faucet_tx_hash = Some(tx);
-                                                        if let Err(e) = funding_store_clone
-                                                            .mark_funded(user_id.get())
-                                                            .await
-                                                        {
-                                                            eprintln!(
-                                                                "Faucet: could not mark funded: {:?}",
-                                                                e
+                                                // Check if address already has sufficient balance
+                                                // If they already received funds (even if not marked in store), skip sending
+                                                match address_clone.parse::<Address>() {
+                                                    Ok(address) => {
+                                                        match faucet.provider.get_balance(address).await {
+                                                            Ok(balance) => {
+                                                        // Check if balance is at least the expected amount (or close to it)
+                                                        // This handles cases where they received funds but weren't marked as funded
+                                                        if balance >= faucet.amount {
+                                                            println!(
+                                                                "Faucet: address {} already has balance {} wei (>= {} wei), marking as funded without sending",
+                                                                address_clone, balance, faucet.amount
                                                             );
+                                                            // Mark as funded since they already have the funds
+                                                            if let Err(e) = funding_store_clone
+                                                                .mark_funded(user_id.get())
+                                                                .await
+                                                            {
+                                                                eprintln!(
+                                                                    "Faucet: could not mark funded: {:?}",
+                                                                    e
+                                                                );
+                                                            }
+                                                            // Don't send funds, they already have them
+                                                        } else {
+                                                            // Balance is less than expected, proceed with sending
+                                                            println!(
+                                                                "Faucet: sending laneBTC to {} for user {} (current balance: {} wei)",
+                                                                address_clone, user_id, balance
+                                                            );
+                                                            match faucet.send_funds(&address_clone).await {
+                                                                Ok(tx) => {
+                                                                    println!("Faucet sent: tx hash {:?}", tx);
+                                                                    faucet_tx_hash = Some(tx);
+                                                                    if let Err(e) = funding_store_clone
+                                                                        .mark_funded(user_id.get())
+                                                                        .await
+                                                                    {
+                                                                        eprintln!(
+                                                                            "Faucet: could not mark funded: {:?}",
+                                                                            e
+                                                                        );
+                                                                    }
+                                                                }
+                                                                Err(e) => {
+                                                                    eprintln!(
+                                                                        "Faucet error for user {}: {:?}",
+                                                                        user_id, e
+                                                                    );
+                                                                    faucet_error = Some(format!("Failed to send laneBTC: {}", e));
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                     Err(e) => {
                                                         eprintln!(
-                                                            "Faucet error for user {}: {:?}",
-                                                            user_id, e
+                                                            "Faucet: could not check balance for address {}: {:?}",
+                                                            address_clone, e
                                                         );
-                                                        faucet_error = Some(format!("Failed to send laneBTC: {}", e));
+                                                        // If balance check fails, proceed with sending (fail open)
+                                                        println!(
+                                                            "Faucet: sending laneBTC to {} for user {} (balance check failed)",
+                                                            address_clone, user_id
+                                                        );
+                                                        match faucet.send_funds(&address_clone).await {
+                                                            Ok(tx) => {
+                                                                println!("Faucet sent: tx hash {:?}", tx);
+                                                                faucet_tx_hash = Some(tx);
+                                                                if let Err(e) = funding_store_clone
+                                                                    .mark_funded(user_id.get())
+                                                                    .await
+                                                                {
+                                                                    eprintln!(
+                                                                        "Faucet: could not mark funded: {:?}",
+                                                                        e
+                                                                    );
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                eprintln!(
+                                                                    "Faucet error for user {}: {:?}",
+                                                                    user_id, e
+                                                                );
+                                                                faucet_error = Some(format!("Failed to send laneBTC: {}", e));
+                                                            }
+                                                        }
+                                                    }
+                                                        }
+                                                    },
+                                                    Err(e) => {
+                                                        eprintln!("Faucet: invalid address {}: {:?}", address_clone, e);
+                                                        faucet_error = Some("Invalid Core Lane address".to_string());
                                                     }
                                                 }
                                             }

@@ -381,6 +381,34 @@ impl EventHandler for Handler {
         // Handle button clicks
         if let Some(component) = interaction.clone().message_component() {
             if component.data.custom_id == "start_onboarding" {
+                let user_id = component.user.id.get();
+
+                // Check if user has already received laneBTC - if so, they've completed onboarding
+                let has_received_funding = match self.funding_store.has_funded(user_id).await {
+                    Ok(true) => true,
+                    Ok(false) => false,
+                    Err(e) => {
+                        eprintln!("Error checking funding status for user {}: {:?}", user_id, e);
+                        false // Fail open - allow them to proceed if check fails
+                    }
+                };
+
+                if has_received_funding {
+                    // User has already received laneBTC - they've completed onboarding
+                    let message = "ℹ️ **You have already completed onboarding!**\n\nYou've already received your laneBTC. Please check your laneBTC balance in MetaMask. If you don't have it, please contact an admin.";
+
+                    let response = CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content(message)
+                            .ephemeral(true),
+                    );
+
+                    if let Err(e) = component.create_response(&ctx.http, response).await {
+                        eprintln!("Error responding to already-funded user: {:?}", e);
+                    }
+                    return;
+                }
+
                 // Show form modal with both questions
                 // Note: The first parameter is the custom_id, second is the label
                 let why_input = CreateInputText::new(

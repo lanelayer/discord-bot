@@ -264,6 +264,11 @@ impl Faucet {
         let tx_hash = *pending_tx.tx_hash();
         println!("Faucet: Transaction broadcast: {:?}", tx_hash);
 
+        // Get initial balance of recipient to verify later if needed
+        let initial_balance = self.provider.get_balance(to).await
+            .map_err(|e| anyhow::anyhow!("Failed to get initial balance: {}", e))?;
+        println!("Faucet: Recipient initial balance: {} wei", initial_balance);
+
         // Update nonce tracker now that we've successfully sent the transaction
         // This ensures we track all sent transactions for proper nonce sequencing
         // Even if the transaction later fails on-chain, we've used this nonce
@@ -273,10 +278,10 @@ impl Faucet {
             println!("Faucet: Updated nonce tracker to {} after successful send", nonce);
         }
 
-        // Wait for transaction confirmation
+        // Wait for transaction confirmation (increased timeout to 60 seconds for slow networks)
         println!("Faucet: Waiting for transaction confirmation...");
         let mut confirmed = false;
-        for i in 0..30 {
+        for i in 0..60 {
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             if let Ok(Some(receipt)) = self.provider.get_transaction_receipt(tx_hash).await {
                 let status_ok = receipt.status();
@@ -290,13 +295,42 @@ impl Faucet {
                     return Err(anyhow::anyhow!("Transaction failed on-chain"));
                 }
             }
-            if i == 29 {
-                println!("Faucet: Warning: Transaction not confirmed after 30 seconds");
+            if i == 29 || i == 59 {
+                println!("Faucet: Still waiting for confirmation... ({} seconds elapsed)", i + 1);
             }
         }
 
         if !confirmed {
-            return Err(anyhow::anyhow!("Transaction not confirmed within timeout period"));
+            // Transaction not confirmed within timeout - check balance to see if funds were actually received
+            println!("Faucet: Transaction not confirmed within timeout, checking balance to verify...");
+            match self.provider.get_balance(to).await {
+                Ok(current_balance) => {
+                    println!("Faucet: Recipient balance after timeout: {} wei (initial: {} wei)", current_balance, initial_balance);
+                    // Check if balance increased by at least the expected amount (allowing for some variance)
+                    // We use >= to handle cases where they might have received other funds
+                    let balance_increase = current_balance.saturating_sub(initial_balance);
+                    if balance_increase >= self.amount {
+                        println!("Faucet: Balance verification successful! Balance increased by {} wei (expected: {} wei)", balance_increase, self.amount);
+                        println!("Faucet: Transaction likely succeeded even though receipt wasn't received in time");
+                        // Consider it successful based on balance check
+                        confirmed = true;
+                    } else {
+                        println!("Faucet: Balance did not increase sufficiently. Increase: {} wei, Expected: {} wei", balance_increase, self.amount);
+                    }
+                }
+                Err(e) => {
+                    println!("Faucet: Could not verify balance after timeout: {:?}", e);
+                }
+            }
+        }
+
+        if !confirmed {
+            // Transaction not confirmed and balance check didn't verify success
+            // Return error with tx_hash for manual verification
+            return Err(anyhow::anyhow!(
+                "Transaction not confirmed within timeout period (60 seconds). Transaction hash: {:?}. The transaction may still be pending. Please verify manually.",
+                tx_hash
+            ));
         }
 
         Ok(tx_hash)
@@ -543,24 +577,21 @@ impl EventHandler for Handler {
                                     }
                                 }
 
-                                // Update the initial message with success
-                                let success_msg = "**Onboarding Successful!**\n\nWelcome! You have been verified and given access to all channels.\n\nProcessing laneBTC faucet...";
-                                let _ = modal_clone.edit_response(
-                                    &ctx_clone.http,
-                                    EditInteractionResponse::new().content(success_msg)
-                                ).await;
-
-                                // Handle faucet
+                                // Handle faucet - check balance BEFORE showing "Processing" message
                                 let mut faucet_tx_hash: Option<alloy_primitives::B256> = None;
                                 let mut faucet_error: Option<String> = None;
+                                #[allow(unused_assignments)]
+                                let mut needs_funding = false; // Track if user actually needs funds
 
                                 if let Some(faucet) = &faucet_clone {
+                                    // First check funding store
                                     match funding_store_clone.has_funded(user_id.get()).await {
                                         Ok(true) => {
                                             println!(
-                                                "Faucet: user {} already funded, skipping",
+                                                "Faucet: user {} already funded in store, skipping",
                                                 user_id
                                             );
+                                            needs_funding = false;
                                         }
                                         Ok(false) => {
                                             if address_clone.is_empty() {
@@ -569,31 +600,53 @@ impl EventHandler for Handler {
                                                     user_id
                                                 );
                                                 faucet_error = Some("No address provided".to_string());
+                                                needs_funding = false;
                                             } else {
-                                                println!(
-                                                    "Faucet: sending laneBTC to {} for user {}",
-                                                    address_clone, user_id
-                                                );
-                                                match faucet.send_funds(&address_clone).await {
-                                                    Ok(tx) => {
-                                                        println!("Faucet sent: tx hash {:?}", tx);
-                                                        faucet_tx_hash = Some(tx);
-                                                        if let Err(e) = funding_store_clone
-                                                            .mark_funded(user_id.get())
-                                                            .await
-                                                        {
-                                                            eprintln!(
-                                                                "Faucet: could not mark funded: {:?}",
-                                                                e
-                                                            );
+                                                // Check if address already has sufficient balance BEFORE showing processing message
+                                                match address_clone.parse::<Address>() {
+                                                    Ok(address) => {
+                                                        match faucet.provider.get_balance(address).await {
+                                                            Ok(balance) => {
+                                                                // Check if balance is at least the expected amount
+                                                                if balance >= faucet.amount {
+                                                                    println!(
+                                                                        "Faucet: address {} already has balance {} wei (>= {} wei), marking as funded without sending",
+                                                                        address_clone, balance, faucet.amount
+                                                                    );
+                                                                    // Mark as funded since they already have the funds
+                                                                    if let Err(e) = funding_store_clone
+                                                                        .mark_funded(user_id.get())
+                                                                        .await
+                                                                    {
+                                                                        eprintln!(
+                                                                            "Faucet: could not mark funded: {:?}",
+                                                                            e
+                                                                        );
+                                                                    }
+                                                                    needs_funding = false; // Don't send funds, they already have them
+                                                                } else {
+                                                                    // Balance is less than expected, they need funding
+                                                                    println!(
+                                                                        "Faucet: address {} has balance {} wei (< {} wei), will send funds",
+                                                                        address_clone, balance, faucet.amount
+                                                                    );
+                                                                    needs_funding = true;
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                eprintln!(
+                                                                    "Faucet: could not check balance for address {}: {:?}",
+                                                                    address_clone, e
+                                                                );
+                                                                // If balance check fails, assume they need funding (fail open)
+                                                                needs_funding = true;
+                                                            }
                                                         }
                                                     }
                                                     Err(e) => {
-                                                        eprintln!(
-                                                            "Faucet error for user {}: {:?}",
-                                                            user_id, e
-                                                        );
-                                                        faucet_error = Some(format!("Failed to send laneBTC: {}", e));
+                                                        eprintln!("Faucet: invalid address {}: {:?}", address_clone, e);
+                                                        faucet_error = Some("Invalid Core Lane address".to_string());
+                                                        needs_funding = false;
                                                     }
                                                 }
                                             }
@@ -601,30 +654,87 @@ impl EventHandler for Handler {
                                         Err(e) => {
                                             eprintln!("Faucet: could not check funding store: {:?}", e);
                                             faucet_error = Some("Failed to check funding status".to_string());
+                                            needs_funding = false;
                                         }
                                     }
+
+                                    // Now show appropriate message based on whether funding is needed
+                                    if needs_funding {
+                                        // User needs funds - show processing message and send
+                                        let success_msg = "**Onboarding Successful!**\n\nWelcome! You have been verified and given access to all channels.\n\nProcessing laneBTC faucet...";
+                                        let _ = modal_clone.edit_response(
+                                            &ctx_clone.http,
+                                            EditInteractionResponse::new().content(success_msg)
+                                        ).await;
+
+                                        // Send funds
+                                        println!(
+                                            "Faucet: sending laneBTC to {} for user {}",
+                                            address_clone, user_id
+                                        );
+                                        match faucet.send_funds(&address_clone).await {
+                                            Ok(tx) => {
+                                                println!("Faucet sent: tx hash {:?}", tx);
+                                                faucet_tx_hash = Some(tx);
+                                                if let Err(e) = funding_store_clone
+                                                    .mark_funded(user_id.get())
+                                                    .await
+                                                {
+                                                    eprintln!(
+                                                        "Faucet: could not mark funded: {:?}",
+                                                        e
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                eprintln!(
+                                                    "Faucet error for user {}: {:?}",
+                                                    user_id, e
+                                                );
+                                                faucet_error = Some(format!("Failed to send laneBTC: {}", e));
+                                            }
+                                        }
+                                    } else {
+                                        // User already has funds - show success without processing message
+                                        let success_msg = "**Onboarding Successful!**\n\nWelcome! You have been verified and given access to all channels.";
+                                        let _ = modal_clone.edit_response(
+                                            &ctx_clone.http,
+                                            EditInteractionResponse::new().content(success_msg)
+                                        ).await;
+                                    }
+                                } else {
+                                    // No faucet configured - show success message
+                                    let success_msg = "**Onboarding Successful!**\n\nWelcome! You have been verified and given access to all channels.";
+                                    let _ = modal_clone.edit_response(
+                                        &ctx_clone.http,
+                                        EditInteractionResponse::new().content(success_msg)
+                                    ).await;
                                 }
 
-                                // Build follow-up message
-                                let followup_msg = if let Some(tx_hash) = faucet_tx_hash {
-                                    format!(
-                                        "✅ **laneBTC sent!** Transaction: `{:?}`",
-                                        tx_hash
-                                    )
-                                } else if let Some(err) = faucet_error {
-                                    format!("⚠️ **Faucet issue:** {}", err)
-                                } else if let Some(init_err) = faucet_error_msg {
-                                    format!("⚠️ **Faucet not configured:** {}", init_err)
-                                } else {
-                                    "ℹ️ Faucet not configured. Please check environment variables: FAUCET_RPC_URL, FAUCET_PRIVATE_KEY, FAUCET_AMOUNT_WEI".to_string()
-                                };
+                                // Build and send follow-up message only if there's something to report
+                                // (transaction sent, error occurred, or faucet not configured)
+                                // Don't send message if user already had funds
+                                if faucet_tx_hash.is_some() || faucet_error.is_some() || faucet_error_msg.is_some() {
+                                    let followup_msg = if let Some(tx_hash) = faucet_tx_hash {
+                                        format!(
+                                            "✅ **laneBTC sent!** Transaction: `{:?}`",
+                                            tx_hash
+                                        )
+                                    } else if let Some(err) = faucet_error {
+                                        format!("⚠️ **Faucet issue:** {}", err)
+                                    } else if let Some(init_err) = faucet_error_msg {
+                                        format!("⚠️ **Faucet not configured:** {}", init_err)
+                                    } else {
+                                        "ℹ️ Faucet not configured. Please check environment variables: FAUCET_RPC_URL, FAUCET_PRIVATE_KEY, FAUCET_AMOUNT_WEI".to_string()
+                                    };
 
-                                // Send follow-up message
-                                if let Err(e) = modal_clone
-                                    .create_followup(&ctx_clone.http, CreateInteractionResponseFollowup::new().content(followup_msg).ephemeral(true))
-                                    .await
-                                {
-                                    eprintln!("Error sending follow-up message: {:?}", e);
+                                    // Send follow-up message
+                                    if let Err(e) = modal_clone
+                                        .create_followup(&ctx_clone.http, CreateInteractionResponseFollowup::new().content(followup_msg).ephemeral(true))
+                                        .await
+                                    {
+                                        eprintln!("Error sending follow-up message: {:?}", e);
+                                    }
                                 }
                             }
                             Err(e) => {

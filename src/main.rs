@@ -278,10 +278,10 @@ impl Faucet {
             println!("Faucet: Updated nonce tracker to {} after successful send", nonce);
         }
 
-        // Wait for transaction confirmation (increased timeout to 60 seconds for slow networks)
+        // Wait for transaction confirmation (increased timeout to 1200 seconds for slow networks)
         println!("Faucet: Waiting for transaction confirmation...");
         let mut confirmed = false;
-        for i in 0..60 {
+        for i in 0..1200 {
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             if let Ok(Some(receipt)) = self.provider.get_transaction_receipt(tx_hash).await {
                 let status_ok = receipt.status();
@@ -295,7 +295,8 @@ impl Faucet {
                     return Err(anyhow::anyhow!("Transaction failed on-chain"));
                 }
             }
-            if i == 29 || i == 59 {
+            // Log progress every 60 seconds
+            if (i + 1) % 60 == 0 {
                 println!("Faucet: Still waiting for confirmation... ({} seconds elapsed)", i + 1);
             }
         }
@@ -328,7 +329,7 @@ impl Faucet {
             // Transaction not confirmed and balance check didn't verify success
             // Return error with tx_hash for manual verification
             return Err(anyhow::anyhow!(
-                "Transaction not confirmed within timeout period (60 seconds). Transaction hash: {:?}. The transaction may still be pending. Please verify manually.",
+                "Transaction not confirmed within timeout period. Transaction hash: {:?}. The transaction may still be pending. Please verify manually.",
                 tx_hash
             ));
         }

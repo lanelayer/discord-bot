@@ -506,7 +506,7 @@ impl EventHandler for Handler {
                 if address.is_empty() {
                     let error_response = CreateInteractionResponse::Message(
                         CreateInteractionResponseMessage::new()
-                            .content("❌ **Validation Error**\n\nCore Lane Address is required. Please provide a valid Ethereum address.")
+                            .content("**Validation Error**\n\nCore Lane Address is required. Please provide a valid Ethereum address.")
                             .ephemeral(true),
                     );
                     if let Err(e) = modal.create_response(&ctx.http, error_response).await {
@@ -524,7 +524,7 @@ impl EventHandler for Handler {
                         let error_response = CreateInteractionResponse::Message(
                             CreateInteractionResponseMessage::new()
                                 .content(format!(
-                                    "❌ **Invalid Address Format**\n\n`{}` is not a valid Ethereum address.\n\nPlease provide a valid Core Lane address (Ethereum format, e.g., `0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb`).",
+                                    "**Invalid Address Format**\n\n`{}` is not a valid Ethereum address.\n\nPlease provide a valid Core Lane address (Ethereum format).",
                                     address
                                 ))
                                 .ephemeral(true),

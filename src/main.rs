@@ -348,6 +348,62 @@ struct Handler {
     _state: OnboardingState,
 }
 
+impl Handler {
+    fn create_onboarding_modal(
+        &self,
+        why_joined: Option<&str>,
+        address: Option<&str>,
+        error_message: Option<&str>,
+    ) -> CreateModal {
+        let mut components = Vec::new();
+
+        // Add error message field if there's an error
+        if let Some(error) = error_message {
+            let error_input = CreateInputText::new(
+                InputTextStyle::Short,
+                "error_message",
+                "Error",
+            )
+            .value(error)
+            .required(false);
+            components.push(CreateActionRow::InputText(error_input));
+        }
+
+        // Why joined field
+        let mut why_input = CreateInputText::new(
+            InputTextStyle::Paragraph,
+            "Why did you join our server?",
+            "Why did you join our server?",
+        )
+        .required(true)
+        .placeholder("Please tell us why you joined...")
+        .max_length(500);
+        
+        if let Some(value) = why_joined {
+            why_input = why_input.value(value);
+        }
+        components.push(CreateActionRow::InputText(why_input));
+
+        // Core Lane Address field
+        let mut address_input = CreateInputText::new(
+            InputTextStyle::Short,
+            "Core Lane Address",
+            "Core Lane Address",
+        )
+        .required(true)
+        .placeholder("Enter your Core Lane address...")
+        .max_length(100);
+        
+        if let Some(value) = address {
+            address_input = address_input.value(value);
+        }
+        components.push(CreateActionRow::InputText(address_input));
+
+        CreateModal::new("onboarding_form", "Onboarding Form")
+            .components(components)
+    }
+}
+
 #[async_trait]
 impl EventHandler for Handler {
     async fn ready(&self, ctx: Context, ready: Ready) {
@@ -445,31 +501,7 @@ impl EventHandler for Handler {
                 }
 
                 // Show form modal with both questions
-                // Note: The first parameter is the custom_id, second is the label
-                let why_input = CreateInputText::new(
-                    InputTextStyle::Paragraph,
-                    "Why did you join our server?",  // This becomes the custom_id
-                    "Why did you join our server?",  // This is the label
-                )
-                .required(true)
-                .placeholder("Please tell us why you joined...")
-                .max_length(500);
-
-                let address_input = CreateInputText::new(
-                    InputTextStyle::Short,
-                    "Core Lane Address",  // This becomes the custom_id
-                    "Core Lane Address",  // This is the label
-                )
-                .required(true)
-                .placeholder("Enter your Core Lane address...")
-                .max_length(100);
-
-                let modal = CreateModal::new("onboarding_form", "Onboarding Form")
-                    .components(vec![
-                        CreateActionRow::InputText(why_input),
-                        CreateActionRow::InputText(address_input),
-                    ]);
-
+                let modal = self.create_onboarding_modal(None, None, None);
                 let response = CreateInteractionResponse::Modal(modal);
 
                 if let Err(e) = component.create_response(&ctx.http, response).await {
@@ -489,6 +521,10 @@ impl EventHandler for Handler {
                 for row in &modal.data.components {
                     for comp in &row.components {
                         if let ActionRowComponent::InputText(input) = comp {
+                            // Skip error message field
+                            if input.custom_id == "error_message" {
+                                continue;
+                            }
                             if input.custom_id.contains("Why did you join") || input.custom_id == "why_joined" {
                                 why_joined = input.value.as_ref().map(|s| s.clone()).unwrap_or_default();
                             } else if input.custom_id.contains("Core Lane Address") || input.custom_id == "corelane_address" {
@@ -504,11 +540,12 @@ impl EventHandler for Handler {
 
                 // Validate Core Lane address format (must be a valid Ethereum address)
                 if address.is_empty() {
-                    let error_response = CreateInteractionResponse::Message(
-                        CreateInteractionResponseMessage::new()
-                            .content("**Validation Error**\n\nCore Lane Address is required. Please provide a valid Ethereum address.")
-                            .ephemeral(true),
+                    let error_modal = self.create_onboarding_modal(
+                        Some(&why_joined),
+                        None,
+                        Some("Core Lane Address is required. Please provide a valid Ethereum address."),
                     );
+                    let error_response = CreateInteractionResponse::Modal(error_modal);
                     if let Err(e) = modal.create_response(&ctx.http, error_response).await {
                         eprintln!("Error responding to form validation: {:?}", e);
                     }
@@ -521,14 +558,12 @@ impl EventHandler for Handler {
                         // Address is valid, continue with processing
                     }
                     Err(_) => {
-                        let error_response = CreateInteractionResponse::Message(
-                            CreateInteractionResponseMessage::new()
-                                .content(format!(
-                                    "**Invalid Address Format**\n\n`{}` is not a valid Ethereum address.\n\nPlease provide a valid Core Lane address (Ethereum format).",
-                                    address
-                                ))
-                                .ephemeral(true),
+                        let error_modal = self.create_onboarding_modal(
+                            Some(&why_joined),
+                            Some(&address),
+                            Some(&format!("Invalid address format: `{}` is not a valid Ethereum address.", address)),
                         );
+                        let error_response = CreateInteractionResponse::Modal(error_modal);
                         if let Err(e) = modal.create_response(&ctx.http, error_response).await {
                             eprintln!("Error responding to form validation: {:?}", e);
                         }

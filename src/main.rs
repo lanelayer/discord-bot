@@ -502,6 +502,40 @@ impl EventHandler for Handler {
                 let why_joined = why_joined.trim().to_string();
                 let address = address.trim().to_string();
 
+                // Validate Core Lane address format (must be a valid Ethereum address)
+                if address.is_empty() {
+                    let error_response = CreateInteractionResponse::Message(
+                        CreateInteractionResponseMessage::new()
+                            .content("❌ **Validation Error**\n\nCore Lane Address is required. Please provide a valid Ethereum address.")
+                            .ephemeral(true),
+                    );
+                    if let Err(e) = modal.create_response(&ctx.http, error_response).await {
+                        eprintln!("Error responding to form validation: {:?}", e);
+                    }
+                    return;
+                }
+
+                // Validate that the address is a valid Ethereum address format
+                match address.parse::<Address>() {
+                    Ok(_) => {
+                        // Address is valid, continue with processing
+                    }
+                    Err(_) => {
+                        let error_response = CreateInteractionResponse::Message(
+                            CreateInteractionResponseMessage::new()
+                                .content(format!(
+                                    "❌ **Invalid Address Format**\n\n`{}` is not a valid Ethereum address.\n\nPlease provide a valid Core Lane address (Ethereum format, e.g., `0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb`).",
+                                    address
+                                ))
+                                .ephemeral(true),
+                        );
+                        if let Err(e) = modal.create_response(&ctx.http, error_response).await {
+                            eprintln!("Error responding to form validation: {:?}", e);
+                        }
+                        return;
+                    }
+                }
+
                 // RESPOND IMMEDIATELY to avoid Discord timeout (must be within 3 seconds)
                 let initial_msg = "**Processing your onboarding...**\n\nPlease wait while we verify and set up your account.";
                 let response = CreateInteractionResponse::Message(

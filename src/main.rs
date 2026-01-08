@@ -355,19 +355,12 @@ impl Handler {
         address: Option<&str>,
         error_message: Option<&str>,
     ) -> CreateModal {
-        let mut components = Vec::new();
-
-        // Add error message field if there's an error
-        if let Some(error) = error_message {
-            let error_input = CreateInputText::new(
-                InputTextStyle::Short,
-                "error_message",
-                "Error",
-            )
-            .value(error)
-            .required(false);
-            components.push(CreateActionRow::InputText(error_input));
-        }
+        // Determine modal title based on error state
+        let modal_title = if error_message.is_some() {
+            "Onboarding Form - Validation Error"
+        } else {
+            "Onboarding Form"
+        };
 
         // Why joined field
         let mut why_input = CreateInputText::new(
@@ -378,29 +371,42 @@ impl Handler {
         .required(true)
         .placeholder("Please tell us why you joined...")
         .max_length(500);
-        
+
         if let Some(value) = why_joined {
             why_input = why_input.value(value);
         }
-        components.push(CreateActionRow::InputText(why_input));
 
-        // Core Lane Address field
+        // Core Lane Address field - embed error in label if present
+        let address_label = if let Some(error) = error_message {
+            format!("Core Lane Address ⚠️ {}", error)
+        } else {
+            "Core Lane Address".to_string()
+        };
+
         let mut address_input = CreateInputText::new(
             InputTextStyle::Short,
             "Core Lane Address",
-            "Core Lane Address",
+            &address_label,
         )
         .required(true)
-        .placeholder("Enter your Core Lane address...")
         .max_length(100);
-        
+
+        // Set placeholder based on error state
+        if error_message.is_some() {
+            address_input = address_input.placeholder("Please enter a valid Ethereum address...");
+        } else {
+            address_input = address_input.placeholder("Enter your Core Lane address...");
+        }
+
         if let Some(value) = address {
             address_input = address_input.value(value);
         }
-        components.push(CreateActionRow::InputText(address_input));
 
-        CreateModal::new("onboarding_form", "Onboarding Form")
-            .components(components)
+        CreateModal::new("onboarding_form", modal_title)
+            .components(vec![
+                CreateActionRow::InputText(why_input),
+                CreateActionRow::InputText(address_input),
+            ])
     }
 }
 
@@ -521,10 +527,6 @@ impl EventHandler for Handler {
                 for row in &modal.data.components {
                     for comp in &row.components {
                         if let ActionRowComponent::InputText(input) = comp {
-                            // Skip error message field
-                            if input.custom_id == "error_message" {
-                                continue;
-                            }
                             if input.custom_id.contains("Why did you join") || input.custom_id == "why_joined" {
                                 why_joined = input.value.as_ref().map(|s| s.clone()).unwrap_or_default();
                             } else if input.custom_id.contains("Core Lane Address") || input.custom_id == "corelane_address" {
@@ -558,10 +560,12 @@ impl EventHandler for Handler {
                         // Address is valid, continue with processing
                     }
                     Err(_) => {
+                        // Sanitize address for error message to prevent markdown injection
+                        let sanitized_address = address.replace('`', "'").replace('*', "").replace('_', "");
                         let error_modal = self.create_onboarding_modal(
                             Some(&why_joined),
                             Some(&address),
-                            Some(&format!("Invalid address format: `{}` is not a valid Ethereum address.", address)),
+                            Some(&format!("Invalid format: {} is not a valid Ethereum address", sanitized_address)),
                         );
                         let error_response = CreateInteractionResponse::Modal(error_modal);
                         if let Err(e) = modal.create_response(&ctx.http, error_response).await {

@@ -376,24 +376,24 @@ impl Handler {
             why_input = why_input.value(value);
         }
 
-        // Core Lane Address field - embed error in label if present
-        let address_label = if let Some(error) = error_message {
-            format!("Core Lane Address ⚠️ {}", error)
+        // Core Lane Address field - use short fixed label, detailed error in placeholder
+        let address_label = if error_message.is_some() {
+            "Core Lane Address — Invalid address"
         } else {
-            "Core Lane Address".to_string()
+            "Core Lane Address"
         };
 
         let mut address_input = CreateInputText::new(
             InputTextStyle::Short,
             "Core Lane Address",
-            &address_label,
+            address_label,
         )
         .required(true)
         .max_length(100);
 
-        // Set placeholder based on error state
-        if error_message.is_some() {
-            address_input = address_input.placeholder("Please enter a valid Ethereum address...");
+        // Set placeholder based on error state - full error message goes here
+        if let Some(error) = error_message {
+            address_input = address_input.placeholder(error);
         } else {
             address_input = address_input.placeholder("Enter your Core Lane address...");
         }

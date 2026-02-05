@@ -164,6 +164,8 @@ impl Faucet {
     }
 
 
+    /// Sends laneBTC and waits for confirmation. Returns the tx hash only when confirmed (or balance-verified).
+    /// Timeout or unconfirmed = Err (transaction failed); we do not treat "pending" as success.
     async fn send_funds(&self, to_addr: &str) -> anyhow::Result<alloy_primitives::B256> {
         let to: Address = to_addr.parse().context("Invalid Core Lane address")?;
         let from = self.signer.address();
@@ -278,10 +280,12 @@ impl Faucet {
             println!("Faucet: Updated nonce tracker to {} after successful send", nonce);
         }
 
-        // Wait for transaction confirmation (increased timeout to 1200 seconds for slow networks)
-        println!("Faucet: Waiting for transaction confirmation...");
+        // Wait for transaction confirmation (up to 20 minutes for slow networks).
+        // If this takes >15 min, the interaction token expires; the handler posts the result to the admin channel.
+        const CONFIRMATION_TIMEOUT_SECS: u32 = 1200;
+        println!("Faucet: Waiting for transaction confirmation (up to {}s)...", CONFIRMATION_TIMEOUT_SECS);
         let mut confirmed = false;
-        for i in 0..1200 {
+        for i in 0..CONFIRMATION_TIMEOUT_SECS {
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
             if let Ok(Some(receipt)) = self.provider.get_transaction_receipt(tx_hash).await {
                 let status_ok = receipt.status();
@@ -325,16 +329,16 @@ impl Faucet {
             }
         }
 
-        if !confirmed {
-            // Transaction not confirmed and balance check didn't verify success
-            // Return error with tx_hash for manual verification
-            return Err(anyhow::anyhow!(
-                "Transaction not confirmed within timeout period. Transaction hash: {:?}. The transaction may still be pending. Please verify manually.",
+        if confirmed {
+            Ok(tx_hash)
+        } else {
+            // Not confirmed within timeout and balance check didn't verify: treat as failure.
+            // Do not mark user as funded; they can retry. Include tx hash for manual verification.
+            Err(anyhow::anyhow!(
+                "Transaction not confirmed within timeout. Tx hash: {:?}. Check block explorer or retry later.",
                 tx_hash
-            ));
+            ))
         }
-
-        Ok(tx_hash)
     }
 }
 
@@ -747,9 +751,9 @@ impl EventHandler for Handler {
                                             address_clone, user_id
                                         );
                                         match faucet.send_funds(&address_clone).await {
-                                            Ok(tx) => {
-                                                println!("Faucet sent: tx hash {:?}", tx);
-                                                faucet_tx_hash = Some(tx);
+                                            Ok(tx_hash) => {
+                                                println!("Faucet sent and confirmed: tx hash {:?}", tx_hash);
+                                                faucet_tx_hash = Some(tx_hash);
                                                 if let Err(e) = funding_store_clone
                                                     .mark_funded(user_id.get())
                                                     .await
@@ -802,12 +806,24 @@ impl EventHandler for Handler {
                                         "ℹ️ Faucet not configured. Please check environment variables: FAUCET_RPC_URL, FAUCET_PRIVATE_KEY, FAUCET_AMOUNT_WEI".to_string()
                                     };
 
-                                    // Send follow-up message
+                                    // Send follow-up (interaction token expires after 15 min; if we waited longer, post to admin channel)
                                     if let Err(e) = modal_clone
-                                        .create_followup(&ctx_clone.http, CreateInteractionResponseFollowup::new().content(followup_msg).ephemeral(true))
+                                        .create_followup(&ctx_clone.http, CreateInteractionResponseFollowup::new().content(&followup_msg).ephemeral(true))
                                         .await
                                     {
                                         eprintln!("Error sending follow-up message: {:?}", e);
+                                        // Token likely expired (e.g. confirmation took >15 min); post to admin channel instead
+                                        if let Some(admin_ch) = admin_channel_id {
+                                            let admin_msg = format!(
+                                                "**Faucet result** (interaction expired, could not reply to user)\n**User:** {} ({})\n{}",
+                                                member.user.name,
+                                                member.user.id,
+                                                followup_msg
+                                            );
+                                            if let Err(ae) = admin_ch.say(&ctx_clone.http, admin_msg).await {
+                                                eprintln!("Error posting faucet result to admin channel: {:?}", ae);
+                                            }
+                                        }
                                     }
                                 }
                             }
